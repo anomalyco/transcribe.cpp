@@ -392,12 +392,12 @@ void reset_streaming_decoder_state(ParakeetSession * pc, const ParakeetModel * p
 // Compile the stream's vocabulary from the begin params (the run-slot
 // extension is borrowed for the begin call only) and drop any retained
 // projections from the previous stream.
-static transcribe_status begin_stream_vocabulary(ParakeetSession * pc, const ParakeetModel * pm,
+static transcribe_status begin_stream_vocabulary(ParakeetSession *             pc,
+                                                 const ParakeetModel *         pm,
                                                  const transcribe_run_params * run_params) {
-    pc->stream_enc_proj.clear();
-    pc->stream_enc_proj_first_frame = 0;
-    pc->stream_vocabulary           = VocabularyBias{};
-    pc->stream_run_params.family    = nullptr;
+    pc->stream_capture.clear();
+    pc->stream_vocabulary        = VocabularyBias{};
+    pc->stream_run_params.family = nullptr;
     if (pm->host_decoder.head_kind == HostHeadKind::CTC) {
         return TRANSCRIBE_OK;
     }
@@ -405,42 +405,48 @@ static transcribe_status begin_stream_vocabulary(ParakeetSession * pc, const Par
 }
 
 // Where the streaming decoder appends this chunk's joint encoder
-// projections: nowhere without an active vocabulary. Retention is bounded
-// to the most recent k_stream_vocab_frames frames; spans before them are
-// not rescored.
-static std::vector<float> * stream_enc_proj_sink(ParakeetSession * pc, const ParakeetModel * pm) {
+// projections and predictor checkpoints: nowhere without an active
+// vocabulary. Retention is bounded to the most recent
+// k_stream_vocab_frames frames (and the checkpoints that reach them);
+// spans before them are not rescored.
+static DecodeCapture * stream_capture_sink(ParakeetSession * pc, const ParakeetModel * pm) {
     if (!pc->stream_vocabulary.active()) {
         return nullptr;
     }
     constexpr int64_t k_stream_vocab_frames = 6000;  // 8 min at 80 ms
+    DecodeCapture &   cap                   = pc->stream_capture;
     const size_t      joint_h               = static_cast<size_t>(pm->host_decoder.joint.joint_h);
-    const int64_t     held = static_cast<int64_t>(pc->stream_enc_proj.size() / std::max<size_t>(joint_h, 1));
+    const int64_t     held                  = static_cast<int64_t>(cap.enc_proj.size() / std::max<size_t>(joint_h, 1));
     if (held > k_stream_vocab_frames) {
         const int64_t drop = held - k_stream_vocab_frames / 2;
-        pc->stream_enc_proj.erase(pc->stream_enc_proj.begin(),
-                                  pc->stream_enc_proj.begin() + static_cast<std::ptrdiff_t>(drop * static_cast<int64_t>(joint_h)));
-        pc->stream_enc_proj_first_frame += drop;
+        cap.enc_proj.erase(cap.enc_proj.begin(),
+                           cap.enc_proj.begin() + static_cast<std::ptrdiff_t>(drop * static_cast<int64_t>(joint_h)));
+        cap.enc_proj_first_frame += drop;
+        size_t keep = 0;  // the last checkpoint before the first kept frame stays
+        while (keep + 1 < cap.checkpoints.size() &&
+               pc->raw_tokens[static_cast<size_t>(cap.checkpoints[keep + 1].token)].step_at_emit <
+                   cap.enc_proj_first_frame) {
+            ++keep;
+        }
+        cap.checkpoints.erase(cap.checkpoints.begin(), cap.checkpoints.begin() + static_cast<std::ptrdiff_t>(keep));
     }
-    return &pc->stream_enc_proj;
+    return &cap;
 }
 
 // Rescore the finished stream's tokens against its vocabulary. Returns
 // whether the tokens changed.
 static transcribe_status finish_stream_vocabulary(ParakeetSession * pc, const ParakeetModel * pm, bool * changed) {
     *changed = false;
-    if (!pc->stream_vocabulary.active() || pc->stream_enc_proj.empty()) {
+    if (!pc->stream_vocabulary.active() || pc->stream_capture.enc_proj.empty()) {
         return TRANSCRIBE_OK;
     }
-    const int    n_frames = static_cast<int>(pc->stream_enc_proj.size() /
-                                          static_cast<size_t>(pm->host_decoder.joint.joint_h));
-    const auto   before   = pc->raw_tokens.size();
+    const auto           before = pc->raw_tokens.size();
     std::vector<int32_t> ids_before;
     for (const auto & t : pc->raw_tokens) {
         ids_before.push_back(t.id);
     }
-    const transcribe_status st =
-        rescore_vocabulary(pm->host_decoder, pm->tok, pc->stream_vocabulary, pc->stream_enc_proj.data(),
-                           pc->stream_enc_proj_first_frame, n_frames, pc->n_threads, pc->raw_tokens);
+    const transcribe_status st = rescore_vocabulary(pm->host_decoder, pm->tok, pc->stream_vocabulary,
+                                                    pc->stream_capture, pc->n_threads, pc->raw_tokens);
     if (st != TRANSCRIBE_OK) {
         return st;
     }
@@ -454,8 +460,7 @@ static transcribe_status finish_stream_vocabulary(ParakeetSession * pc, const Pa
             }
         }
     }
-    pc->stream_enc_proj.clear();
-    pc->stream_enc_proj.shrink_to_fit();
+    pc->stream_capture.clear();
     return TRANSCRIBE_OK;
 }
 
@@ -901,8 +906,8 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
             return st;
         }
     }
-    std::vector<float>   enc_proj;
-    std::vector<float> * enc_proj_out = vocabulary.active() ? &enc_proj : nullptr;
+    DecodeCapture   capture;
+    DecodeCapture * capture_out = vocabulary.active() ? &capture : nullptr;
 
     pc->raw_tokens.clear();
     const int64_t t_dec_start = ggml_time_us();
@@ -910,12 +915,11 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
         transcribe_status st = TRANSCRIBE_OK;
         switch (pm->host_decoder.head_kind) {
             case HostHeadKind::TDT:
-                st = decode_tdt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens,
-                                       enc_proj_out);
+                st = decode_tdt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens, capture_out);
                 break;
             case HostHeadKind::RNNT:
-                st = decode_rnnt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens,
-                                        enc_proj_out);
+                st =
+                    decode_rnnt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens, capture_out);
                 break;
             case HostHeadKind::CTC:
                 st = decode_ctc_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens);
@@ -925,9 +929,9 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
             return st;
         }
     }
-    if (enc_proj_out != nullptr) {
-        if (const transcribe_status st = rescore_vocabulary(pm->host_decoder, pm->tok, vocabulary, enc_proj.data(), 0,
-                                                            T_enc, pc->n_threads, pc->raw_tokens);
+    if (capture_out != nullptr) {
+        if (const transcribe_status st =
+                rescore_vocabulary(pm->host_decoder, pm->tok, vocabulary, capture, pc->n_threads, pc->raw_tokens);
             st != TRANSCRIBE_OK) {
             return st;
         }
@@ -2870,7 +2874,7 @@ transcribe_status emit_streaming_chunk(ParakeetSession * pc,
     if (const transcribe_status st = decode_rnnt_greedy_streaming(
             pm->host_decoder, pc->enc_host.data(), T_q_new, d_enc, pc->stream_dec_state.lstm_state,
             pc->stream_dec_state.prev_token_id, static_cast<int>(pc->stream_dec_state.frame_offset), pc->n_threads,
-            pc->raw_tokens, stream_enc_proj_sink(pc, pm));
+            pc->raw_tokens, stream_capture_sink(pc, pm));
         st != TRANSCRIBE_OK) {
         return st;
     }
@@ -3264,7 +3268,7 @@ transcribe_status emit_buffered_chunk(ParakeetSession * pc,
     if (const transcribe_status st = decode_rnnt_greedy_streaming(
             pm->host_decoder, enc_chunk, T_to_decode, d_enc, pc->stream_dec_state.lstm_state,
             pc->stream_dec_state.prev_token_id, static_cast<int>(pc->stream_dec_state.frame_offset), pc->n_threads,
-            pc->raw_tokens, stream_enc_proj_sink(pc, pm));
+            pc->raw_tokens, stream_capture_sink(pc, pm));
         st != TRANSCRIBE_OK) {
         return st;
     }

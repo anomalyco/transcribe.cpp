@@ -14,10 +14,10 @@
 #include "decoder.h"
 
 #include "parakeet.h"
-#include "vocabulary.h"
 #include "transcribe-batch-util.h"
 #include "transcribe-debug.h"
 #include "transcribe-log.h"
+#include "vocabulary.h"
 #include "weights.h"
 
 // ggml-backend.h, not ggml-cpu.h: under GGML_BACKEND_DL the CPU backend
@@ -1022,7 +1022,7 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
                                     int                        d_enc,
                                     int                        n_threads,
                                     std::vector<TdtToken> &    out_tokens,
-                                    std::vector<float> *       enc_proj_out) {
+                                    DecodeCapture *            capture) {
     if (enc_out == nullptr || T_enc <= 0 || d_enc <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -1169,6 +1169,9 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
             tok.p               = p;
             tok.step_at_emit    = step;
             tok.duration_frames = duration;
+            if (capture != nullptr && out_tokens.size() % DecodeCapture::k_checkpoint_every == 0) {
+                capture->checkpoints.push_back({ static_cast<int>(out_tokens.size()), last_token, state });
+            }
             out_tokens.push_back(tok);
 
             last_token = pred_token;
@@ -1224,8 +1227,9 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
                 max_iters);
         return TRANSCRIBE_ERR_BACKEND;
     }
-    if (enc_proj_out != nullptr) {
-        *enc_proj_out = std::move(enc_proj_all);
+    if (capture != nullptr) {
+        capture->enc_proj             = std::move(enc_proj_all);
+        capture->enc_proj_first_frame = 0;
     }
     return TRANSCRIBE_OK;
 }
@@ -1260,7 +1264,7 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
                                      int                        d_enc,
                                      int                        n_threads,
                                      std::vector<TdtToken> &    out_tokens,
-                                     std::vector<float> *       enc_proj_out) {
+                                     DecodeCapture *            capture) {
     if (enc_out == nullptr || T_enc <= 0 || d_enc <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -1378,6 +1382,9 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
             tok.p               = p;
             tok.step_at_emit    = step;
             tok.duration_frames = 1;
+            if (capture != nullptr && out_tokens.size() % DecodeCapture::k_checkpoint_every == 0) {
+                capture->checkpoints.push_back({ static_cast<int>(out_tokens.size()), last_token, state });
+            }
             out_tokens.push_back(tok);
 
             last_token = pred_token;
@@ -1406,8 +1413,9 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
                 max_iters);
         return TRANSCRIBE_ERR_BACKEND;
     }
-    if (enc_proj_out != nullptr) {
-        *enc_proj_out = std::move(enc_proj_all);
+    if (capture != nullptr) {
+        capture->enc_proj             = std::move(enc_proj_all);
+        capture->enc_proj_first_frame = 0;
     }
     return TRANSCRIBE_OK;
 }
@@ -1429,7 +1437,7 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
                                                int                        frame_offset,
                                                int                        n_threads,
                                                std::vector<TdtToken> &    out_tokens,
-                                               std::vector<float> *       enc_proj_sink) {
+                                               DecodeCapture *            capture) {
     if (enc_out == nullptr || T_enc_new <= 0 || d_enc <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -1543,6 +1551,9 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
             tok.p               = p;
             tok.step_at_emit    = frame_offset + step;
             tok.duration_frames = 1;
+            if (capture != nullptr && out_tokens.size() % DecodeCapture::k_checkpoint_every == 0) {
+                capture->checkpoints.push_back({ static_cast<int>(out_tokens.size()), last_token, state });
+            }
             out_tokens.push_back(tok);
 
             last_token = pred_token;
@@ -1566,9 +1577,9 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
     // non-blank state (the predictor's "current" since the last emit).
     state_io      = std::move(state);
     last_token_io = last_token;
-    if (enc_proj_sink != nullptr) {
-        enc_proj_sink->insert(enc_proj_sink->end(), enc_proj_all.begin(),
-                              enc_proj_all.begin() + static_cast<std::ptrdiff_t>(T_enc_new) * joint_h);
+    if (capture != nullptr) {
+        capture->enc_proj.insert(capture->enc_proj.end(), enc_proj_all.begin(),
+                                 enc_proj_all.begin() + static_cast<std::ptrdiff_t>(T_enc_new) * joint_h);
     }
     return TRANSCRIBE_OK;
 }
@@ -1918,7 +1929,7 @@ struct WindowScorer {
         }
         const int           T2 = W + max_dur;
         std::vector<double> alpha(static_cast<size_t>((U + 1) * T2), k_neg_inf);
-        alpha[0] = 0.0;
+        alpha[0]   = 0.0;
         double end = k_neg_inf;
         for (int t = 0; t < W; ++t) {
             for (int u = 0; u <= U; ++u) {
@@ -1956,21 +1967,23 @@ struct ScoredCandidate {
 
 }  // namespace
 
-transcribe_status rescore_vocabulary(const HostDecoderWeights & w,
+transcribe_status rescore_vocabulary(const HostDecoderWeights &    w,
                                      const transcribe::Tokenizer & tok,
-                                     const VocabularyBias &       bias,
-                                     const float *                enc_proj,
-                                     int64_t                      enc_proj_first_frame,
-                                     int                          n_frames,
-                                     int                          n_threads,
-                                     std::vector<TdtToken> &      tokens) {
-    if (!bias.active() || tokens.empty() || enc_proj == nullptr || n_frames <= 0 ||
+                                     const VocabularyBias &        bias,
+                                     const DecodeCapture &         capture,
+                                     int                           n_threads,
+                                     std::vector<TdtToken> &       tokens) {
+    const int64_t joint_h  = w.joint.joint_h;
+    const int     n_frames = joint_h > 0 ? static_cast<int>(capture.enc_proj.size() / static_cast<size_t>(joint_h)) : 0;
+    if (!bias.active() || tokens.empty() || n_frames <= 0 || capture.checkpoints.empty() ||
         w.head_kind == HostHeadKind::CTC) {
         return TRANSCRIBE_OK;
     }
-    const int64_t                          t_start    = ggml_time_us();
-    const std::vector<VocabularyWord>      words      = vocabulary_words(tok, tokens);
-    const std::vector<VocabularyCandidate> candidates = find_vocabulary_candidates(words, bias);
+    const float *                          enc_proj             = capture.enc_proj.data();
+    const int64_t                          enc_proj_first_frame = capture.enc_proj_first_frame;
+    const int64_t                          t_start              = ggml_time_us();
+    const std::vector<VocabularyWord>      words                = vocabulary_words(tok, tokens);
+    const std::vector<VocabularyCandidate> candidates           = find_vocabulary_candidates(words, bias);
     if (candidates.empty()) {
         return TRANSCRIBE_OK;
     }
@@ -1981,11 +1994,15 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights & w,
         return TRANSCRIBE_ERR_BACKEND;
     }
 
-    // Predictor state before each candidate's first token, by replaying the
-    // greedy tokens (the same lazy state machine as the decoders).
+    // Predictor state before each candidate's first token: the decoder's
+    // nearest checkpoint at or before it, stepped through the tokens in
+    // between (the same lazy state machine as the decoders). A candidate
+    // before the first retained checkpoint is not rescored.
     std::vector<int> needed;
     for (const VocabularyCandidate & c : candidates) {
-        needed.push_back(c.first);
+        if (c.first >= capture.checkpoints.front().token) {
+            needed.push_back(c.first);
+        }
     }
     std::sort(needed.begin(), needed.end());
     needed.erase(std::unique(needed.begin(), needed.end()), needed.end());
@@ -1993,27 +2010,24 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights & w,
     {
         const int          n_layers = static_cast<int>(w.predictor.lstm.size());
         const int          H        = w.predictor.pred_hidden;
-        LstmState          state;
         LstmState          next_state;
         std::vector<float> scratch_x;
-        state.reset(n_layers, H);
         next_state.reset(n_layers, H);
-        int    last = -1;
-        size_t k    = 0;
-        for (int i = 0; i <= needed.back(); ++i) {
-            if (k < needed.size() && needed[k] == i) {
-                snapshots[k].state      = state;
-                snapshots[k].last_token = last;
-                ++k;
-                if (k == needed.size()) {
-                    break;
+        for (size_t k = 0; k < needed.size(); ++k) {
+            const auto cp    = std::upper_bound(capture.checkpoints.begin(), capture.checkpoints.end(), needed[k],
+                                                [](int t, const PredictorCheckpoint & c) { return t < c.token; }) -
+                               1;
+            LstmState  state = cp->state;
+            int        last  = cp->last_token;
+            for (int i = cp->token; i < needed[k]; ++i) {
+                if (predictor_step_ggml(w.predictor, pg, last, state, next_state, scratch_x) == nullptr) {
+                    return TRANSCRIBE_ERR_BACKEND;
                 }
+                std::swap(state, next_state);
+                last = tokens[static_cast<size_t>(i)].id;
             }
-            if (predictor_step_ggml(w.predictor, pg, last, state, next_state, scratch_x) == nullptr) {
-                return TRANSCRIBE_ERR_BACKEND;
-            }
-            std::swap(state, next_state);
-            last = tokens[static_cast<size_t>(i)].id;
+            snapshots[k].state      = std::move(state);
+            snapshots[k].last_token = last;
         }
     }
 
@@ -2029,7 +2043,7 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights & w,
         // neighbouring tokens' frames. When the next token falls inside the
         // tail, both paths must end by emitting it there; otherwise by a
         // blank at the window's last frame.
-        int64_t s = std::max<int64_t>(first.step_at_emit - k_vocab_window_lead, 0);
+        int64_t          s     = std::max<int64_t>(first.step_at_emit - k_vocab_window_lead, 0);
         if (c.first > 0) {
             s = std::max<int64_t>(s, tokens[static_cast<size_t>(c.first - 1)].step_at_emit);
         }
@@ -2052,13 +2066,16 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights & w,
         if (!build_window_joint(joint, w.joint, pg.backend, W)) {
             return TRANSCRIBE_ERR_BACKEND;
         }
-        ggml_backend_tensor_set(joint.enc_in,
-                                enc_proj + static_cast<size_t>(s - enc_proj_first_frame) *
-                                               static_cast<size_t>(w.joint.joint_h),
-                                0, static_cast<size_t>(W) * static_cast<size_t>(w.joint.joint_h) * sizeof(float));
+        ggml_backend_tensor_set(
+            joint.enc_in,
+            enc_proj + static_cast<size_t>(s - enc_proj_first_frame) * static_cast<size_t>(w.joint.joint_h), 0,
+            static_cast<size_t>(W) * static_cast<size_t>(w.joint.joint_h) * sizeof(float));
 
-        const size_t snap = static_cast<size_t>(
-            std::lower_bound(needed.begin(), needed.end(), c.first) - needed.begin());
+        const auto snap_at = std::lower_bound(needed.begin(), needed.end(), c.first);
+        if (snap_at == needed.end() || *snap_at != c.first) {
+            continue;
+        }
+        const size_t         snap = static_cast<size_t>(snap_at - needed.begin());
         std::vector<int32_t> heard;
         for (int i = c.first; i < c.end; ++i) {
             heard.push_back(tokens[static_cast<size_t>(i)].id);
@@ -2075,7 +2092,7 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights & w,
         joint_columns += scorer.joint_columns;
         ++scored;
         const double gain = term_lp + boost - heard_lp;
-        std::string span;
+        std::string  span;
         for (const VocabularyWord & word : words) {
             if (word.first >= c.first && word.first < c.end) {
                 span += span.empty() ? word.text : " " + word.text;

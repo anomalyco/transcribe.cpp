@@ -207,6 +207,38 @@ struct TdtToken {
     int   duration_frames = 0;
 };
 
+// What the transducer decoders hand back for vocabulary rescoring
+// (vocabulary.h), so it reuses their work instead of redoing it:
+//   enc_proj     the per-frame joint encoder projections, [T, joint_h]
+//                row-major, absolute frame enc_proj_first_frame first.
+//   checkpoints  the predictor before every k_checkpoint_every-th
+//                emitted token (its LSTM state and previous token as the
+//                decoder held them), so rescoring a span replays at most
+//                k_checkpoint_every - 1 predictor steps.
+// The offline decoders fill a fresh capture; the streaming decoder
+// appends to one.
+struct PredictorCheckpoint {
+    int       token      = 0;  // index into the decoder's out_tokens
+    int       last_token = -1;
+    LstmState state;
+};
+
+struct DecodeCapture {
+    static constexpr int k_checkpoint_every = 8;
+
+    std::vector<float>               enc_proj;
+    int64_t                          enc_proj_first_frame = 0;
+    std::vector<PredictorCheckpoint> checkpoints;
+
+    void clear() {
+        enc_proj.clear();
+        enc_proj.shrink_to_fit();
+        enc_proj_first_frame = 0;
+        checkpoints.clear();
+        checkpoints.shrink_to_fit();
+    }
+};
+
 // Run TDT greedy decode end-to-end against an encoder output buffer.
 //
 // Inputs:
@@ -228,7 +260,7 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
                                     int                        d_enc,
                                     int                        n_threads,
                                     std::vector<TdtToken> &    out_tokens,
-                                    std::vector<float> *       enc_proj_out = nullptr);
+                                    DecodeCapture *            capture = nullptr);
 
 // Run RNNT greedy decode end-to-end. Same predictor + joint code as TDT,
 // but the joint emits `vocab+1` logits (no duration extras) and the step
@@ -241,7 +273,7 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
                                      int                        d_enc,
                                      int                        n_threads,
                                      std::vector<TdtToken> &    out_tokens,
-                                     std::vector<float> *       enc_proj_out = nullptr);
+                                     DecodeCapture *            capture = nullptr);
 
 // Streaming variant of RNN-T greedy decode. Consumes T_enc_new encoder
 // frames (the chunk just produced) and APPENDS emitted tokens to
@@ -259,13 +291,10 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
                                                int                        frame_offset,
                                                int                        n_threads,
                                                std::vector<TdtToken> &    out_tokens,
-                                               std::vector<float> *       enc_proj_sink = nullptr);
+                                               DecodeCapture *            capture = nullptr);
 
-// enc_proj_out / enc_proj_sink: when non-null, the transducer decoders
-// hand back the per-frame joint encoder projections they computed
-// ([T, joint_h], row-major) so vocabulary rescoring can reuse them: the
-// offline decoders move theirs into *enc_proj_out, the streaming decoder
-// appends the chunk's rows to *enc_proj_sink.
+// capture: when non-null, filled (offline) or appended to (streaming) for
+// vocabulary rescoring; see DecodeCapture.
 
 // Run CTC greedy decode end-to-end. Per-frame: logits = W @ enc[t] + b,
 // argmax; collapse rule "drop adjacent duplicates, then drop blanks"
@@ -281,18 +310,15 @@ transcribe_status decode_ctc_greedy(const HostDecoderWeights & w,
 
 struct VocabularyBias;
 
-// Vocabulary rescoring (vocabulary.h). `enc_proj` holds the joint encoder
-// projections of absolute frames [enc_proj_first_frame,
-// enc_proj_first_frame + n_frames); spans whose window falls outside them
-// are left alone. Rewrites `tokens` in place: each accepted span's tokens
-// become the term's pieces, spread over the span's frames. No-op for CTC
-// heads or an inactive bias.
+// Vocabulary rescoring (vocabulary.h) of the tokens a decoder emitted
+// into `capture`. Spans whose window falls outside the captured frames, or
+// before its first checkpoint, are left alone. Rewrites `tokens` in place:
+// each accepted span's tokens become the term's pieces, spread over the
+// span's frames. No-op for CTC heads or an inactive bias.
 transcribe_status rescore_vocabulary(const HostDecoderWeights &    w,
                                      const transcribe::Tokenizer & tok,
                                      const VocabularyBias &        bias,
-                                     const float *                 enc_proj,
-                                     int64_t                       enc_proj_first_frame,
-                                     int                           n_frames,
+                                     const DecodeCapture &         capture,
                                      int                           n_threads,
                                      std::vector<TdtToken> &       tokens);
 

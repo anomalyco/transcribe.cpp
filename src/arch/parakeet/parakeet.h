@@ -9,13 +9,13 @@
 
 #include "../sortformer/sortformer.h"  // embedded diarizer (multitalker bundle)
 #include "decoder.h"
-#include "vocabulary.h"
 #include "transcribe-backend.h"
 #include "transcribe-load-common.h"
 #include "transcribe-mel.h"
 #include "transcribe-model.h"
 #include "transcribe-session.h"
 #include "transcribe-tokenizer.h"
+#include "vocabulary.h"
 #include "weights.h"
 
 #include <cstdint>
@@ -338,10 +338,9 @@ struct ParakeetSession final : public transcribe_session {
     transcribe_run_params stream_run_params{};
     // Vocabulary compiled at stream_begin, and the joint encoder
     // projections retained for rescoring at finalize (bounded; see
-    // stream_enc_proj_sink in model.cpp).
+    // stream_capture_sink in model.cpp).
     VocabularyBias        stream_vocabulary;
-    std::vector<float>    stream_enc_proj;
-    int64_t               stream_enc_proj_first_frame = 0;
+    DecodeCapture         stream_capture;
     // Convert from cumulative samples so odd feed sizes do not lose fractions.
     int64_t               stream_audio_input_samples = 0;
 

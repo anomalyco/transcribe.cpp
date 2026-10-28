@@ -78,9 +78,7 @@ struct VocabularyBias {
 // or exceed the bounds are skipped with a warning. An inactive result
 // (no terms, or boost 0) means no rescoring. Fails only on a malformed
 // extension.
-transcribe_status compile_vocabulary(const Tokenizer &             tok,
-                                     const transcribe_run_params * params,
-                                     VocabularyBias &              out);
+transcribe_status compile_vocabulary(const Tokenizer & tok, const transcribe_run_params * params, VocabularyBias & out);
 
 // One word of the transcript: raw token range and the range without its
 // trailing punctuation pieces. `text` is the core's decoded text.

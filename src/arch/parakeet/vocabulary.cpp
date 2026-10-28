@@ -199,8 +199,8 @@ transcribe_status compile_vocabulary(const Tokenizer &             tok,
             return st;
         }
         ext = reinterpret_cast<const transcribe_parakeet_vocabulary_ext *>(params->family);
-        if (ext->n_sounds_like < 0 || (ext->n_sounds_like > 0 && (ext->sounds_like == nullptr ||
-                                                                   ext->sounds_like_term == nullptr))) {
+        if (ext->n_sounds_like < 0 ||
+            (ext->n_sounds_like > 0 && (ext->sounds_like == nullptr || ext->sounds_like_term == nullptr))) {
             return TRANSCRIBE_ERR_INVALID_ARG;
         }
     }
@@ -249,7 +249,7 @@ transcribe_status compile_vocabulary(const Tokenizer &             tok,
 std::vector<VocabularyWord> vocabulary_words(const Tokenizer & tok, const std::vector<TdtToken> & tokens) {
     std::vector<VocabularyWord> words;
     VocabularyWord              cur;
-    bool                        open = false;
+    bool                        open  = false;
     auto                        close = [&](int end) {
         if (!open) {
             return;
@@ -272,14 +272,14 @@ std::vector<VocabularyWord> vocabulary_words(const Tokenizer & tok, const std::v
             continue;
         }
         const std::string & piece = tok.token(id);
-        const bool starts = !open || (piece.size() >= k_sp_marker_len &&
-                                      std::memcmp(piece.data(), k_sp_marker, k_sp_marker_len) == 0);
+        const bool          starts =
+            !open || (piece.size() >= k_sp_marker_len && std::memcmp(piece.data(), k_sp_marker, k_sp_marker_len) == 0);
         if (starts) {
             close(i);
-            cur      = VocabularyWord{};
-            cur.first = i;
+            cur          = VocabularyWord{};
+            cur.first    = i;
             cur.core_end = i;
-            open     = true;
+            open         = true;
         }
         // Trailing punctuation stays outside the core; a letter after
         // punctuation inside one word ("don't") pulls the core forward.
@@ -362,8 +362,8 @@ std::vector<VocabularyCandidate> find_vocabulary_candidates(const std::vector<Vo
                 if (letters.size() > term.letters.size() &&
                     letters.compare(0, term.letters.size(), term.letters) == 0) {
                     const std::string rest = letters.substr(term.letters.size());
-                    if (rest == "s" || rest == "es" || rest == "ed" || rest == "d" || rest == "ing" ||
-                        rest == "er" || rest == "ers") {
+                    if (rest == "s" || rest == "es" || rest == "ed" || rest == "d" || rest == "ing" || rest == "er" ||
+                        rest == "ers") {
                         continue;
                     }
                 }
