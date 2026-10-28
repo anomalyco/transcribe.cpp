@@ -1813,7 +1813,16 @@ struct WindowScorer {
     // when next_id < 0). TDT: every alignment that has emitted all of `ids`
     // by the last frame, with token and duration probabilities; arrivals
     // that jump past the last frame count as reaching it.
-    bool score(const PredictorSnapshot & start, const std::vector<int32_t> & ids, int next_id, double & out) {
+    //
+    // Every alignment emits each id once at some frame and pays nothing
+    // positive elsewhere, so the sum of each id's best frame bounds the
+    // result. Once that bound falls below `floor`, scoring stops and `out`
+    // is the bound (a term that cannot win costs only the rows it lost on).
+    bool score(const PredictorSnapshot &    start,
+               const std::vector<int32_t> & ids,
+               int                          next_id,
+               double                       floor,
+               double &                     out) {
         const int  W           = joint.W;
         const int  U           = static_cast<int>(ids.size());
         const int  n_token_cls = w.predictor.pred_vocab;
@@ -1833,6 +1842,7 @@ struct WindowScorer {
         next_state.reset(static_cast<int>(w.predictor.lstm.size()), w.predictor.pred_hidden);
         int token = start.last_token;
         logits.resize(static_cast<size_t>(joint_n) * static_cast<size_t>(W));
+        double bound = 0.0;
         for (int u = 0; u <= U; ++u) {
             const float * g = predictor_step_ggml(w.predictor, pg, token, state, next_state, scratch_x);
             if (g == nullptr) {
@@ -1859,6 +1869,17 @@ struct WindowScorer {
                     }
                 } else if (u == U && t == W - 1) {
                     lp_next = next_id >= 0 ? col[next_id] - lse : lp_blank[ut];
+                }
+            }
+            if (u < U) {
+                double best = k_neg_inf;
+                for (int t = 0; t < W; ++t) {
+                    best = std::max(best, lp_tok[static_cast<size_t>(u * W + t)]);
+                }
+                bound += best;
+                if (bound < floor) {
+                    out = bound;
+                    return true;
                 }
             }
             std::swap(state, next_state);
@@ -1996,6 +2017,7 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights & w,
         }
     }
 
+    const int64_t                t_replayed = ggml_time_us();
     const int64_t                last_frame = enc_proj_first_frame + n_frames - 1;
     std::vector<ScoredCandidate> accepted;
     int64_t                      joint_columns = 0;
@@ -2045,18 +2067,24 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights & w,
         double       heard_lp = 0.0;
         double       term_lp  = 0.0;
         const auto & term     = bias.terms[static_cast<size_t>(c.term)];
-        if (!scorer.score(snapshots[snap], heard, next_id, heard_lp) ||
-            !scorer.score(snapshots[snap], term.ids, next_id, term_lp)) {
+        const double boost    = static_cast<double>(bias.boost) * static_cast<double>(term.ids.size());
+        if (!scorer.score(snapshots[snap], heard, next_id, k_neg_inf, heard_lp) ||
+            !scorer.score(snapshots[snap], term.ids, next_id, heard_lp - boost, term_lp)) {
             return TRANSCRIBE_ERR_BACKEND;
         }
         joint_columns += scorer.joint_columns;
         ++scored;
-        const double boost = static_cast<double>(bias.boost) * static_cast<double>(term.ids.size());
-        const double gain  = term_lp + boost - heard_lp;
+        const double gain = term_lp + boost - heard_lp;
+        std::string span;
+        for (const VocabularyWord & word : words) {
+            if (word.first >= c.first && word.first < c.end) {
+                span += span.empty() ? word.text : " " + word.text;
+            }
+        }
         log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
-                "parakeet vocabulary: \"%s\" frames %lld-%lld heard %.2f term %.2f boost %.2f -> %s",
-                term.text.c_str(), static_cast<long long>(s), static_cast<long long>(e), heard_lp, term_lp,
-                boost, gain >= 0.0 ? "replace" : "keep");
+                "parakeet vocabulary: \"%s\" for \"%s\" frames %lld-%lld heard %.2f term %.2f boost %.2f -> %s",
+                term.text.c_str(), span.c_str(), static_cast<long long>(s), static_cast<long long>(e), heard_lp,
+                term_lp, boost, gain >= 0.0 ? "replace" : "keep");
         if (gain >= 0.0) {
             accepted.push_back({ c, gain });
         }
@@ -2111,9 +2139,11 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights & w,
         tokens.swap(out);
     }
 
-    log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "parakeet vocabulary: %d candidates, %d scored, %d replaced, %lld joint columns, %.1f ms",
+    log_msg(TRANSCRIBE_LOG_LEVEL_INFO,
+            "parakeet vocabulary: %d candidates, %d scored, %d replaced, %lld joint columns, %.1f ms (replay %.1f ms)",
             static_cast<int>(candidates.size()), scored, static_cast<int>(chosen.size()),
-            static_cast<long long>(joint_columns), (ggml_time_us() - t_start) / 1000.0);
+            static_cast<long long>(joint_columns), (ggml_time_us() - t_start) / 1000.0,
+            (t_replayed - t_start) / 1000.0);
     return TRANSCRIBE_OK;
 }
 
