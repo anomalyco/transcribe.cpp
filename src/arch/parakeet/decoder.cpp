@@ -2003,17 +2003,19 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights & w,
     for (const VocabularyCandidate & c : candidates) {
         const TdtToken & first = tokens[static_cast<size_t>(c.first)];
         const TdtToken & lastk = tokens[static_cast<size_t>(c.end - 1)];
-        // Window: from the previous token's frame (at most two frames
-        // before the span) to the next token's frame, or a short tail.
-        int64_t s = std::max<int64_t>(first.step_at_emit - 2, 0);
+        // Window: a few frames either side of the span, clipped to the
+        // neighbouring tokens' frames. When the next token falls inside the
+        // tail, both paths must end by emitting it there; otherwise by a
+        // blank at the window's last frame.
+        int64_t s = std::max<int64_t>(first.step_at_emit - k_vocab_window_lead, 0);
         if (c.first > 0) {
             s = std::max<int64_t>(s, tokens[static_cast<size_t>(c.first - 1)].step_at_emit);
         }
         int     next_id = -1;
-        int64_t e       = lastk.step_at_emit + lastk.duration_frames + 12;
+        int64_t e       = lastk.step_at_emit + std::max(lastk.duration_frames, 1) + k_vocab_window_tail;
         if (c.end < static_cast<int>(tokens.size())) {
             const TdtToken & nx = tokens[static_cast<size_t>(c.end)];
-            if (nx.step_at_emit - lastk.step_at_emit <= 25) {
+            if (nx.step_at_emit <= e) {
                 e       = nx.step_at_emit;
                 next_id = nx.id;
             }
@@ -2049,11 +2051,12 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights & w,
         }
         joint_columns += scorer.joint_columns;
         ++scored;
-        const double gain = term_lp + static_cast<double>(bias.boost) - heard_lp;
+        const double boost = static_cast<double>(bias.boost) * static_cast<double>(term.ids.size());
+        const double gain  = term_lp + boost - heard_lp;
         log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
                 "parakeet vocabulary: \"%s\" frames %lld-%lld heard %.2f term %.2f boost %.2f -> %s",
                 term.text.c_str(), static_cast<long long>(s), static_cast<long long>(e), heard_lp, term_lp,
-                static_cast<double>(bias.boost), gain >= 0.0 ? "replace" : "keep");
+                boost, gain >= 0.0 ? "replace" : "keep");
         if (gain >= 0.0) {
             accepted.push_back({ c, gain });
         }

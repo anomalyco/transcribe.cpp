@@ -117,11 +117,13 @@ TRANSCRIBE_API void transcribe_parakeet_buffered_stream_ext_init(struct transcri
  * VOCABULARY) after its greedy decode: a word span of the transcript that
  * sounds like a term (or matches one of its sounds_like spellings) is
  * rescored against the term over the same encoder frames, and the term
- * replaces it when its alignment log-probability plus `boost` is at least
- * the span's. Without this extension the family default boost applies.
+ * replaces it when its alignment log-probability plus `boost` for each of
+ * its pieces is at least the span's. Without this extension the family
+ * default boost applies.
  *
- *   boost        Nats added to a term's score. < 0 selects the family
- *                default; 0 turns rescoring off.
+ *   boost        Nats added to a term's score per SentencePiece piece of
+ *                the term. < 0 selects the family default; 0 turns
+ *                rescoring off.
  *   sounds_like  Optional spellings a transcript may show instead of a
  *                term; sounds_like_term[i] is the index of the
  *                vocabulary entry that sounds_like[i] belongs to.

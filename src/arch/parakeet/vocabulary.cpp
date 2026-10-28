@@ -357,6 +357,16 @@ std::vector<VocabularyCandidate> find_vocabulary_candidates(const std::vector<Vo
                 if (text == term.text || (n == 1 && letters == term.letters)) {
                     continue;
                 }
+                // An inflection of the term is the term, already written
+                // ("Aiden's", "Effects").
+                if (letters.size() > term.letters.size() &&
+                    letters.compare(0, term.letters.size(), term.letters) == 0) {
+                    const std::string rest = letters.substr(term.letters.size());
+                    if (rest == "s" || rest == "es" || rest == "ed" || rest == "d" || rest == "ing" ||
+                        rest == "er" || rest == "ers") {
+                        continue;
+                    }
+                }
                 const float rank = rank_of(letters, t);
                 if (rank < 0.0f) {
                     continue;

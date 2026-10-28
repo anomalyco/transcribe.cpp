@@ -14,11 +14,13 @@
 //   2. rescore_vocabulary (decoder.cpp) scores the term and the span by the
 //      transducer's own forward algorithm over the same encoder frames, from
 //      the same predictor state;
-//   3. the term replaces the span when its log-probability plus `boost` is
-//      at least the span's.
+//   3. the term replaces the span when its log-probability plus `boost`
+//      per term piece is at least the span's.
 //
 // The audio decides; the boost only says how much worse than the heard
-// words a term may score and still win. Bounded: at most k_vocab_max_terms
+// words a term may score and still win. It is per piece because the
+// predictor's own language model charges a rare word for every piece it
+// spells ("▁A b att oir" against "▁avatar"). Bounded: at most k_vocab_max_terms
 // terms of at most k_vocab_max_term_tokens pieces, k_vocab_max_candidates
 // spans per decode, and windows of at most k_vocab_max_window_frames.
 
@@ -44,10 +46,12 @@ constexpr int   k_vocab_max_term_tokens   = 12;
 constexpr int   k_vocab_max_span_words    = 4;
 constexpr int   k_vocab_max_candidates    = 16;
 constexpr int   k_vocab_max_window_frames = 96;
+constexpr int   k_vocab_window_lead       = 4;  // frames before the span's first token
+constexpr int   k_vocab_window_tail       = 6;  // frames after its last
 // Shortest term (in letters) matched by sound alone; shorter terms are
 // matched only through their sounds-like spellings.
 constexpr int   k_vocab_min_fuzzy_letters = 5;
-constexpr float k_vocab_default_boost     = 4.0f;
+constexpr float k_vocab_default_boost     = 3.0f;  // nats per term piece
 
 struct VocabularyTerm {
     std::string          text;

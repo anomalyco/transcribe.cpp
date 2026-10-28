@@ -97,6 +97,12 @@ int main() {
               "open code is a candidate for OpenCode");
     }
     {
+        // Inflections of a term are the term.
+        const auto b = bias({ "Aiden", "Effect" });
+        check(pv::find_vocabulary_candidates(words({ "ask", "Aiden's", "team" }), b).empty(), "possessive");
+        check(pv::find_vocabulary_candidates(words({ "side", "effects", "here" }), b).empty(), "plural");
+    }
+    {
         // A boost of zero turns everything off.
         auto b  = bias({ "Abattoir" });
         b.boost = 0.0f;
