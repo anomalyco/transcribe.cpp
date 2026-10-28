@@ -105,6 +105,38 @@ struct transcribe_parakeet_buffered_stream_ext {
 /* Fills ext.size/kind and left/chunk/right_ms = -1 (model default). */
 TRANSCRIBE_API void transcribe_parakeet_buffered_stream_ext_init(struct transcribe_parakeet_buffered_stream_ext * ext);
 
+/* 'PKVB' little-endian = 0x42564B50 */
+#define TRANSCRIBE_EXT_KIND_PARAKEET_VOCABULARY 0x42564B50u
+
+/*
+ * Vocabulary rescoring knobs (run slot; RNN-T and TDT heads). Applies to
+ * transcribe_run, transcribe_run_batch, and transcribe_stream_begin, which
+ * copies it.
+ *
+ * Parakeet honors transcribe_run_params::vocabulary (TRANSCRIBE_FEATURE_
+ * VOCABULARY) after its greedy decode: a word span of the transcript that
+ * sounds like a term (or matches one of its sounds_like spellings) is
+ * rescored against the term over the same encoder frames, and the term
+ * replaces it when its alignment log-probability plus `boost` is at least
+ * the span's. Without this extension the family default boost applies.
+ *
+ *   boost        Nats added to a term's score. < 0 selects the family
+ *                default; 0 turns rescoring off.
+ *   sounds_like  Optional spellings a transcript may show instead of a
+ *                term; sounds_like_term[i] is the index of the
+ *                vocabulary entry that sounds_like[i] belongs to.
+ */
+struct transcribe_parakeet_vocabulary_ext {
+    struct transcribe_ext ext;
+    float                 boost;
+    const char * const *  sounds_like;
+    const int32_t *       sounds_like_term;
+    int32_t               n_sounds_like;
+};
+
+/* Fills ext.size/kind, boost = -1 (family default), and no spellings. */
+TRANSCRIBE_API void transcribe_parakeet_vocabulary_ext_init(struct transcribe_parakeet_vocabulary_ext * ext);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

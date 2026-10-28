@@ -1026,6 +1026,14 @@ static transcribe_status transcribe_stream_begin_impl(struct transcribe_session 
             return TRANSCRIBE_ERR_INVALID_ARG;
         }
     }
+    if (run_params->family != nullptr) {
+        if (run_params->family->size < sizeof(struct transcribe_ext)) {
+            return TRANSCRIBE_ERR_BAD_STRUCT_SIZE;
+        }
+        if (!transcribe_model_accepts_ext_kind(session->model, TRANSCRIBE_EXT_SLOT_RUN, run_params->family->kind)) {
+            return TRANSCRIBE_ERR_INVALID_ARG;
+        }
+    }
 
     // Advisory warn for pnc/itn requests against models that don't
     // expose the corresponding runtime toggle. Emitted before
@@ -1064,10 +1072,10 @@ static transcribe_status transcribe_stream_begin_impl(struct transcribe_session 
     // (parakeet re-reads .language on every feed), and the public contract
     // lets the caller free every params pointer once begin returns — so the
     // strings are copied into session storage here and the view repointed
-    // at it. `family` (the run-slot extension) is nulled in the view: no
-    // family reads it on the stream path today, and per the ext copy-out
-    // contract a retained pointer to it would dangle; a future family that
-    // wants a run-slot ext at stream begin must plumb it deliberately.
+    // at it. `family` (the run-slot extension) stays the caller's pointer,
+    // validated above against the run slot: it is borrowed for the begin
+    // call only, so a family that reads it (parakeet's vocabulary) copies
+    // what it needs out during begin and nulls it in any retained copy.
     session->stream_language_owned        = run_params->language != nullptr ? run_params->language : "";
     session->stream_target_language_owned = run_params->target_language != nullptr ? run_params->target_language : "";
     // Copied from the normalized view (never the caller's struct, whose
@@ -1077,7 +1085,7 @@ static transcribe_status transcribe_stream_begin_impl(struct transcribe_session 
     run_params_owned.language = run_params->language != nullptr ? session->stream_language_owned.c_str() : nullptr;
     run_params_owned.target_language =
         run_params->target_language != nullptr ? session->stream_target_language_owned.c_str() : nullptr;
-    run_params_owned.family          = nullptr;
+    run_params_owned.family          = run_params->family;
     // Generic prompting strings, same ownership rule. Only non-empty terms
     // are kept, so the view's count matches the owned array.
     session->stream_vocabulary_owned = transcribe::prompting::terms(run_params);

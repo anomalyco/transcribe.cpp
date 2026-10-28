@@ -40,6 +40,24 @@ pub struct WhisperRunOptions {
     pub max_initial_timestamp: Option<f32>,
 }
 
+/// Parakeet vocabulary-rescoring knobs (run slot, transducer heads), for
+/// the terms in `RunOptions::vocabulary`. Also honored at stream begin.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default)
+)]
+pub struct ParakeetVocabularyOptions {
+    /// How much less likely (in nats) a term may score than the heard words
+    /// and still replace them. `None` keeps the family default; `Some(0.0)`
+    /// turns rescoring off.
+    pub boost: Option<f32>,
+    /// Extra spellings the transcript may show for a term, as
+    /// `(index into RunOptions::vocabulary, spelling)`.
+    pub sounds_like: Vec<(usize, String)>,
+}
+
 /// Moonshine-streaming stream-extension knobs (stream slot).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(
@@ -179,6 +197,7 @@ impl DiarizeExtension {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RunExtension {
     Whisper(WhisperRunOptions),
+    ParakeetVocabulary(ParakeetVocabularyOptions),
 }
 
 /// A family extension for the stream slot.
@@ -201,6 +220,12 @@ pub(crate) enum RunExtRaw {
         ext: Box<sys::transcribe_whisper_run_ext>,
         _prompt: Option<CString>,
     },
+    ParakeetVocabulary {
+        ext: Box<sys::transcribe_parakeet_vocabulary_ext>,
+        _spellings: Vec<CString>,
+        _pointers: Vec<*const std::os::raw::c_char>,
+        _terms: Vec<i32>,
+    },
 }
 
 impl RunExtRaw {
@@ -209,6 +234,9 @@ impl RunExtRaw {
             // `ext` is field 0, so &ext == &the family struct.
             RunExtRaw::Whisper { ext, .. } => {
                 (&**ext) as *const sys::transcribe_whisper_run_ext as *const sys::transcribe_ext
+            }
+            RunExtRaw::ParakeetVocabulary { ext, .. } => {
+                (&**ext) as *const sys::transcribe_parakeet_vocabulary_ext as *const sys::transcribe_ext
             }
         }
     }
@@ -241,6 +269,34 @@ impl RunExtension {
                 Ok(RunExtRaw::Whisper {
                     ext: Box::new(ext),
                     _prompt: prompt,
+                })
+            }
+            RunExtension::ParakeetVocabulary(o) => {
+                let mut ext: sys::transcribe_parakeet_vocabulary_ext = unsafe { std::mem::zeroed() };
+                unsafe { sys::transcribe_parakeet_vocabulary_ext_init(&mut ext) };
+                set(&mut ext.boost, o.boost);
+                let spellings = o
+                    .sounds_like
+                    .iter()
+                    .map(|(_, s)| CString::new(s.as_str()))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let pointers: Vec<*const std::os::raw::c_char> =
+                    spellings.iter().map(|c| c.as_ptr()).collect();
+                let terms: Vec<i32> = o
+                    .sounds_like
+                    .iter()
+                    .map(|(term, _)| i32::try_from(*term).unwrap_or(i32::MAX))
+                    .collect();
+                if !pointers.is_empty() {
+                    ext.sounds_like = pointers.as_ptr();
+                    ext.sounds_like_term = terms.as_ptr();
+                    ext.n_sounds_like = i32::try_from(pointers.len()).unwrap_or(i32::MAX);
+                }
+                Ok(RunExtRaw::ParakeetVocabulary {
+                    ext: Box::new(ext),
+                    _spellings: spellings,
+                    _pointers: pointers,
+                    _terms: terms,
                 })
             }
         }

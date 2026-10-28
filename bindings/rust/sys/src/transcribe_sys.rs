@@ -19,6 +19,7 @@ pub const TRANSCRIBE_BACKEND_MASK_ALL: u32 = 4294967295;
 pub const TRANSCRIBE_EXT_KIND_MOONSHINE_STREAMING_STREAM: u32 = 1414746957;
 pub const TRANSCRIBE_EXT_KIND_PARAKEET_STREAM: u32 = 1414744912;
 pub const TRANSCRIBE_EXT_KIND_PARAKEET_BUFFERED_STREAM: u32 = 1396853584;
+pub const TRANSCRIBE_EXT_KIND_PARAKEET_VOCABULARY: u32 = 1112951632;
 pub const TRANSCRIBE_EXT_KIND_SORTFORMER_DIARIZE: u32 = 1380206163;
 pub const TRANSCRIBE_EXT_KIND_VOXTRAL_REALTIME_STREAM: u32 = 1414746710;
 pub const TRANSCRIBE_EXT_KIND_WHISPER_RUN: u32 = 1314015319;
@@ -1567,6 +1568,35 @@ unsafe extern "C" {
     pub fn transcribe_parakeet_buffered_stream_ext_init(
         ext: *mut transcribe_parakeet_buffered_stream_ext,
     );
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct transcribe_parakeet_vocabulary_ext {
+    pub ext: transcribe_ext,
+    pub boost: f32,
+    pub sounds_like: *const *const ::std::os::raw::c_char,
+    pub sounds_like_term: *const i32,
+    pub n_sounds_like: i32,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of transcribe_parakeet_vocabulary_ext"]
+        [::std::mem::size_of::<transcribe_parakeet_vocabulary_ext>() - 48usize];
+    ["Alignment of transcribe_parakeet_vocabulary_ext"]
+        [::std::mem::align_of::<transcribe_parakeet_vocabulary_ext>() - 8usize];
+    ["Offset of field: transcribe_parakeet_vocabulary_ext::ext"]
+        [::std::mem::offset_of!(transcribe_parakeet_vocabulary_ext, ext) - 0usize];
+    ["Offset of field: transcribe_parakeet_vocabulary_ext::boost"]
+        [::std::mem::offset_of!(transcribe_parakeet_vocabulary_ext, boost) - 16usize];
+    ["Offset of field: transcribe_parakeet_vocabulary_ext::sounds_like"]
+        [::std::mem::offset_of!(transcribe_parakeet_vocabulary_ext, sounds_like) - 24usize];
+    ["Offset of field: transcribe_parakeet_vocabulary_ext::sounds_like_term"]
+        [::std::mem::offset_of!(transcribe_parakeet_vocabulary_ext, sounds_like_term) - 32usize];
+    ["Offset of field: transcribe_parakeet_vocabulary_ext::n_sounds_like"]
+        [::std::mem::offset_of!(transcribe_parakeet_vocabulary_ext, n_sounds_like) - 40usize];
+};
+unsafe extern "C" {
+    pub fn transcribe_parakeet_vocabulary_ext_init(ext: *mut transcribe_parakeet_vocabulary_ext);
 }
 impl transcribe_sortformer_preset {
     pub const TRANSCRIBE_SORTFORMER_PRESET_DEFAULT: transcribe_sortformer_preset =

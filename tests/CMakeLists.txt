@@ -218,6 +218,12 @@ target_include_directories(transcribe_parakeet_longform_unit PRIVATE ${CMAKE_SOU
 transcribe_apply_warnings(transcribe_parakeet_longform_unit)
 add_test(NAME transcribe_parakeet_longform_unit COMMAND transcribe_parakeet_longform_unit)
 
+add_executable(transcribe_parakeet_vocabulary_unit parakeet_vocabulary_unit.cpp)
+target_link_libraries(transcribe_parakeet_vocabulary_unit PRIVATE transcribe ggml)
+target_include_directories(transcribe_parakeet_vocabulary_unit PRIVATE ${CMAKE_SOURCE_DIR}/src)
+transcribe_apply_warnings(transcribe_parakeet_vocabulary_unit)
+add_test(NAME transcribe_parakeet_vocabulary_unit COMMAND transcribe_parakeet_vocabulary_unit)
+
 # -----------------------------------------------------------------------------
 # Variable-length batch mask and causal subsampling unit test
 # -----------------------------------------------------------------------------

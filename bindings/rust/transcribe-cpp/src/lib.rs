@@ -72,7 +72,7 @@ pub use diarize::{DiarizeInfo, DiarizeOptions, DiarizeSession, DiarizeSessionOpt
 pub use error::{Error, ErrorKind, ErrorReport, Result};
 pub use family::{
     DiarizeExtension, MoonshineStreamingOptions, ParakeetBufferedStreamOptions,
-    ParakeetStreamOptions, RunExtension, SortformerDiarizeOptions, SortformerPreset,
+    ParakeetStreamOptions, ParakeetVocabularyOptions, RunExtension, SortformerDiarizeOptions, SortformerPreset,
     StreamExtension, VoxtralRealtimeStreamOptions, WhisperRunOptions,
 };
 pub use langid::{
