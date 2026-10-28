@@ -1,4 +1,5 @@
 #include "ggml-vulkan-common.h"
+#include <cctype>
 
 namespace {
 inline std::ostream & operator<<(std::ostream & os, vk::Buffer buffer) {
@@ -580,6 +581,9 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     VK_LOG_DEBUG("ggml_vk_create_pipeline(" << device->name << ", " << pipeline->name << ", " << entrypoint << ", " << parameter_count <<
                  ", (" << wg_denoms[0] << "," << wg_denoms[1] << "," << wg_denoms[2] << "), specialization_constants, " <<
                  disable_robustness << ", " << require_full_subgroups << ", " << required_subgroup_size << ")");
+    if (spv_size == 0) {
+        GGML_ABORT("Vulkan shader for %s is not in this build (GGML_VULKAN_SHADER_TYPES, GGML_VULKAN_MUL_MAT_ID)", pipeline->name.c_str());
+    }
     GGML_ASSERT(parameter_count > 0);
     GGML_ASSERT(parameter_count <= MAX_PARAMETER_COUNT);
     GGML_ASSERT(wg_denoms[0] > 0 && wg_denoms[1] > 0 && wg_denoms[2] > 0); // NOLINT
@@ -15321,9 +15325,46 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
     return ggml_backend_vk_init(ctx->device);
 }
 
+// GGML_VULKAN_SHADER_TYPES and GGML_VULKAN_MUL_MAT_ID=OFF build no shaders for
+// the excluded types and ops, so the scheduler must run those elsewhere.
+static bool ggml_vk_shaders_built_for(const ggml_tensor * op) {
+    if (!ggml_vk_mul_mat_id_shaders && op->op == GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    auto const & built = [](const ggml_tensor * t) {
+        if (t == nullptr) {
+            return true;
+        }
+        const char * type = ggml_type_name(t->type);
+        for (const char * const * excluded = ggml_vk_excluded_types; *excluded != nullptr; ++excluded) {
+            size_t i = 0;
+            while (type[i] != '\0' && std::tolower((unsigned char) type[i]) == (*excluded)[i]) {
+                ++i;
+            }
+            if (type[i] == '\0' && (*excluded)[i] == '\0') {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!built(op)) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (!built(op->src[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
+
+    if (!ggml_vk_shaders_built_for(op)) {
+        return false;
+    }
 
     const bool uses_bda = (op->op == GGML_OP_IM2COL || op->op == GGML_OP_IM2COL_3D) &&
                           device->shader_int64 && device->buffer_device_address;

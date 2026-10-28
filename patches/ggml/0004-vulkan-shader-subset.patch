@@ -1,0 +1,225 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3eacd4cd..d4964382 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -228,6 +228,8 @@ option(GGML_VULKAN_MEMORY_DEBUG             "ggml: enable Vulkan memory debug ou
+ option(GGML_VULKAN_SHADER_DEBUG_INFO        "ggml: enable Vulkan shader debug info"           OFF)
+ option(GGML_VULKAN_VALIDATE                 "ggml: enable Vulkan validation"                  OFF)
+ option(GGML_VULKAN_RUN_TESTS                "ggml: run Vulkan tests"                          OFF)
++option(GGML_VULKAN_MUL_MAT_ID               "ggml: build Vulkan MUL_MAT_ID (MoE) shaders"     ON)
++set   (GGML_VULKAN_SHADER_TYPES "" CACHE STRING "ggml: comma-separated tensor types to build Vulkan shaders for (empty builds all)")
+ option(GGML_WEBGPU                          "ggml: use WebGPU"                                OFF)
+ option(GGML_WEBGPU_DEBUG                    "ggml: enable WebGPU debug output"                OFF)
+ option(GGML_WEBGPU_CPU_PROFILE              "ggml: enable WebGPU profiling (CPU)"             OFF)
+diff --git a/src/ggml-vulkan/CMakeLists.txt b/src/ggml-vulkan/CMakeLists.txt
+index d7dec92a..6b4f20df 100644
+--- a/src/ggml-vulkan/CMakeLists.txt
++++ b/src/ggml-vulkan/CMakeLists.txt
+@@ -212,6 +212,17 @@ if (Vulkan_FOUND)
+     set (_ggml_vk_output_dir "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders.spv")
+     set (_ggml_vk_generated_shader_files ${_ggml_vk_header})
+ 
++    # Optional shader subset; the filter file reruns the generator when it changes.
++    set (_ggml_vk_shader_filter "")
++    if (GGML_VULKAN_SHADER_TYPES)
++        list(APPEND _ggml_vk_shader_filter --types ${GGML_VULKAN_SHADER_TYPES})
++    endif()
++    if (NOT GGML_VULKAN_MUL_MAT_ID)
++        list(APPEND _ggml_vk_shader_filter --no-mul-mat-id)
++    endif()
++    set (_ggml_vk_shader_filter_file "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders-filter.txt")
++    file(CONFIGURE OUTPUT ${_ggml_vk_shader_filter_file} CONTENT "${_ggml_vk_shader_filter}\n")
++
+     file(GLOB _ggml_vk_shader_files CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.comp")
+     set_source_files_properties(${_ggml_vk_shader_files} PROPERTIES HEADER_FILE_ONLY TRUE)
+     target_sources(ggml-vulkan PRIVATE ${_ggml_vk_shader_files})
+@@ -229,7 +240,9 @@ if (Vulkan_FOUND)
+         COMMAND ${_ggml_vk_genshaders_cmd}
+             --output-dir ${_ggml_vk_output_dir}
+             --target-hpp ${_ggml_vk_header}
++            ${_ggml_vk_shader_filter}
+         DEPENDS ${_ggml_vk_shaders_gen_sources}
++                ${_ggml_vk_shader_filter_file}
+                 vulkan-shaders-gen
+         COMMENT "Generate vulkan shaders header"
+     )
+@@ -248,8 +261,10 @@ if (Vulkan_FOUND)
+                 --output-dir ${_ggml_vk_output_dir}
+                 --target-hpp ${_ggml_vk_header}
+                 --target-cpp ${_ggml_vk_target_cpp}
++                ${_ggml_vk_shader_filter}
+             DEPENDS ${file_full}
+                     ${_ggml_vk_shaders_gen_sources}
++                    ${_ggml_vk_shader_filter_file}
+                     vulkan-shaders-gen
+             COMMENT "Generate vulkan shaders for ${file}"
+         )
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index 5587dfc2..0db0e3c5 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1,4 +1,5 @@
+ #include "ggml-vulkan-common.h"
++#include <cctype>
+ 
+ namespace {
+ inline std::ostream & operator<<(std::ostream & os, vk::Buffer buffer) {
+@@ -580,6 +581,9 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
+     VK_LOG_DEBUG("ggml_vk_create_pipeline(" << device->name << ", " << pipeline->name << ", " << entrypoint << ", " << parameter_count <<
+                  ", (" << wg_denoms[0] << "," << wg_denoms[1] << "," << wg_denoms[2] << "), specialization_constants, " <<
+                  disable_robustness << ", " << require_full_subgroups << ", " << required_subgroup_size << ")");
++    if (spv_size == 0) {
++        GGML_ABORT("Vulkan shader for %s is not in this build (GGML_VULKAN_SHADER_TYPES, GGML_VULKAN_MUL_MAT_ID)", pipeline->name.c_str());
++    }
+     GGML_ASSERT(parameter_count > 0);
+     GGML_ASSERT(parameter_count <= MAX_PARAMETER_COUNT);
+     GGML_ASSERT(wg_denoms[0] > 0 && wg_denoms[1] > 0 && wg_denoms[2] > 0); // NOLINT
+@@ -15321,10 +15325,47 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const
+     return ggml_backend_vk_init(ctx->device);
+ }
+ 
++// GGML_VULKAN_SHADER_TYPES and GGML_VULKAN_MUL_MAT_ID=OFF build no shaders for
++// the excluded types and ops, so the scheduler must run those elsewhere.
++static bool ggml_vk_shaders_built_for(const ggml_tensor * op) {
++    if (!ggml_vk_mul_mat_id_shaders && op->op == GGML_OP_MUL_MAT_ID) {
++        return false;
++    }
++    auto const & built = [](const ggml_tensor * t) {
++        if (t == nullptr) {
++            return true;
++        }
++        const char * type = ggml_type_name(t->type);
++        for (const char * const * excluded = ggml_vk_excluded_types; *excluded != nullptr; ++excluded) {
++            size_t i = 0;
++            while (type[i] != '\0' && std::tolower((unsigned char) type[i]) == (*excluded)[i]) {
++                ++i;
++            }
++            if (type[i] == '\0' && (*excluded)[i] == '\0') {
++                return false;
++            }
++        }
++        return true;
++    };
++    if (!built(op)) {
++        return false;
++    }
++    for (int i = 0; i < GGML_MAX_SRC; ++i) {
++        if (!built(op->src[i])) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+     const vk_device& device = ggml_vk_get_device(ctx->device);
+ 
++    if (!ggml_vk_shaders_built_for(op)) {
++        return false;
++    }
++
+     const bool uses_bda = (op->op == GGML_OP_IM2COL || op->op == GGML_OP_IM2COL_3D) &&
+                           device->shader_int64 && device->buffer_device_address;
+ 
+diff --git a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 7597b3d3..00a6ac8d 100644
+--- a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -77,6 +77,17 @@ const std::vector<std::string> type_names = {
+     "bf16",
+ };
+ 
++// --types limits shaders to these tensor types; empty builds every type.
++// --no-mul-mat-id drops the MUL_MAT_ID shaders. Excluded shaders keep their
++// symbols with zero length, and ggml-vulkan refuses the ops that need them.
++std::vector<std::string> enabled_types;
++bool mul_mat_id_enabled = true;
++std::vector<std::string> excluded_shader_names;
++
++bool type_enabled(const std::string& tname) {
++    return enabled_types.empty() || std::find(enabled_types.begin(), enabled_types.end(), tname) != enabled_types.end();
++}
++
+ enum MatMulIdType {
+     NONE,
+     DEFAULT,
+@@ -432,6 +443,21 @@ std::map<std::string, std::string> merge_maps(const std::map<std::string, std::s
+     return result;
+ }
+ 
++// A shader is excluded when an underscore-delimited run of its name is a
++// disabled type, or when it is a MUL_MAT_ID variant and those are disabled.
++bool shader_excluded(const std::string& name) {
++    if (!mul_mat_id_enabled && (string_starts_with(name, "matmul_id") || string_starts_with(name, "mul_mat_vec_id_"))) {
++        return true;
++    }
++    const std::string padded = "_" + name + "_";
++    for (const auto& tname : type_names) {
++        if (!type_enabled(tname) && padded.find("_" + tname + "_") != std::string::npos) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ static std::deque<std::future<void>> compiles;
+ void string_to_spv(std::string name, const std::string& source, const std::map<std::string, std::string>& defines, bool fp16 = true, bool coopmat = false, bool coopmat2 = false, bool f16acc = false, const std::string& suffix = "") {
+     name = name + (f16acc ? "_f16acc" : "") + (coopmat ? "_cm1" : "") + (coopmat2 ? "_cm2" : (fp16 ? "" : "_fp32")) + suffix;
+@@ -446,6 +472,11 @@ void string_to_spv(std::string name, const std::string& source, const std::map<s
+         return;
+     }
+ 
++    if (shader_excluded(name)) {
++        excluded_shader_names.push_back(name);
++        return;
++    }
++
+     compile_count_guard slot = acquire_compile_slot();
+     compiles.push_back(std::async(
+         string_to_spv_func, name, input_filepath, out_path, defines, coopmat, generate_dep_file, std::move(slot)));
+@@ -1276,6 +1307,20 @@ void write_output_files() {
+         }
+     }
+ 
++    for (const auto& name : excluded_shader_names) {
++        src << "const uint64_t " << name << "_len = 0;\n";
++        src << "const unsigned char " << name << "_data[1] = {0};\n\n";
++    }
++
++    hdr << "inline constexpr bool ggml_vk_mul_mat_id_shaders = " << (mul_mat_id_enabled ? "true" : "false") << ";\n";
++    hdr << "inline constexpr const char * ggml_vk_excluded_types[] = {";
++    for (const auto& tname : type_names) {
++        if (!type_enabled(tname)) {
++            hdr << "\"" << tname << "\", ";
++        }
++    }
++    hdr << "nullptr};\n\n";
++
+     std::string suffixes[2] = {"_f32", "_f16"};
+     for (std::string op : {"add", "sub", "mul", "div", "add_rms"}) {
+         hdr << "extern const void * " << op << "_data[2][2][2];\n";
+@@ -1417,6 +1462,23 @@ int main(int argc, char** argv) {
+     if (args.find("--target-cpp") != args.end()) {
+         target_cpp = args["--target-cpp"]; // Path to generated cpp file
+     }
++    if (args.find("--types") != args.end()) {
++        std::stringstream types(args["--types"]); // Comma-separated tensor types to build
++        for (std::string tname; std::getline(types, tname, ',');) {
++            if (std::find(type_names.begin(), type_names.end(), tname) == type_names.end()) {
++                std::cerr << "Unknown shader type in --types: " << tname << "\n";
++                return EXIT_FAILURE;
++            }
++            enabled_types.push_back(tname);
++        }
++        if (!type_enabled("f32") || !type_enabled("f16")) {
++            std::cerr << "--types must include f32 and f16\n";
++            return EXIT_FAILURE;
++        }
++    }
++    if (args.find("--no-mul-mat-id") != args.end()) {
++        mul_mat_id_enabled = false;
++    }
+ 
+     if (!directory_exists(output_dir)) {
+         if (!create_directory(output_dir)) {

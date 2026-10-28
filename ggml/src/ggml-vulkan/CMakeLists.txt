@@ -212,6 +212,17 @@ if (Vulkan_FOUND)
     set (_ggml_vk_output_dir "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders.spv")
     set (_ggml_vk_generated_shader_files ${_ggml_vk_header})
 
+    # Optional shader subset; the filter file reruns the generator when it changes.
+    set (_ggml_vk_shader_filter "")
+    if (GGML_VULKAN_SHADER_TYPES)
+        list(APPEND _ggml_vk_shader_filter --types ${GGML_VULKAN_SHADER_TYPES})
+    endif()
+    if (NOT GGML_VULKAN_MUL_MAT_ID)
+        list(APPEND _ggml_vk_shader_filter --no-mul-mat-id)
+    endif()
+    set (_ggml_vk_shader_filter_file "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders-filter.txt")
+    file(CONFIGURE OUTPUT ${_ggml_vk_shader_filter_file} CONTENT "${_ggml_vk_shader_filter}\n")
+
     file(GLOB _ggml_vk_shader_files CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.comp")
     set_source_files_properties(${_ggml_vk_shader_files} PROPERTIES HEADER_FILE_ONLY TRUE)
     target_sources(ggml-vulkan PRIVATE ${_ggml_vk_shader_files})
@@ -229,7 +240,9 @@ if (Vulkan_FOUND)
         COMMAND ${_ggml_vk_genshaders_cmd}
             --output-dir ${_ggml_vk_output_dir}
             --target-hpp ${_ggml_vk_header}
+            ${_ggml_vk_shader_filter}
         DEPENDS ${_ggml_vk_shaders_gen_sources}
+                ${_ggml_vk_shader_filter_file}
                 vulkan-shaders-gen
         COMMENT "Generate vulkan shaders header"
     )
@@ -248,8 +261,10 @@ if (Vulkan_FOUND)
                 --output-dir ${_ggml_vk_output_dir}
                 --target-hpp ${_ggml_vk_header}
                 --target-cpp ${_ggml_vk_target_cpp}
+                ${_ggml_vk_shader_filter}
             DEPENDS ${file_full}
                     ${_ggml_vk_shaders_gen_sources}
+                    ${_ggml_vk_shader_filter_file}
                     vulkan-shaders-gen
             COMMENT "Generate vulkan shaders for ${file}"
         )

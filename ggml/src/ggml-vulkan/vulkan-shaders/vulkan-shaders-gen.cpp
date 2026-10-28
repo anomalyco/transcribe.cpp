@@ -77,6 +77,17 @@ const std::vector<std::string> type_names = {
     "bf16",
 };
 
+// --types limits shaders to these tensor types; empty builds every type.
+// --no-mul-mat-id drops the MUL_MAT_ID shaders. Excluded shaders keep their
+// symbols with zero length, and ggml-vulkan refuses the ops that need them.
+std::vector<std::string> enabled_types;
+bool mul_mat_id_enabled = true;
+std::vector<std::string> excluded_shader_names;
+
+bool type_enabled(const std::string& tname) {
+    return enabled_types.empty() || std::find(enabled_types.begin(), enabled_types.end(), tname) != enabled_types.end();
+}
+
 enum MatMulIdType {
     NONE,
     DEFAULT,
@@ -432,6 +443,21 @@ std::map<std::string, std::string> merge_maps(const std::map<std::string, std::s
     return result;
 }
 
+// A shader is excluded when an underscore-delimited run of its name is a
+// disabled type, or when it is a MUL_MAT_ID variant and those are disabled.
+bool shader_excluded(const std::string& name) {
+    if (!mul_mat_id_enabled && (string_starts_with(name, "matmul_id") || string_starts_with(name, "mul_mat_vec_id_"))) {
+        return true;
+    }
+    const std::string padded = "_" + name + "_";
+    for (const auto& tname : type_names) {
+        if (!type_enabled(tname) && padded.find("_" + tname + "_") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static std::deque<std::future<void>> compiles;
 void string_to_spv(std::string name, const std::string& source, const std::map<std::string, std::string>& defines, bool fp16 = true, bool coopmat = false, bool coopmat2 = false, bool f16acc = false, const std::string& suffix = "") {
     name = name + (f16acc ? "_f16acc" : "") + (coopmat ? "_cm1" : "") + (coopmat2 ? "_cm2" : (fp16 ? "" : "_fp32")) + suffix;
@@ -443,6 +469,11 @@ void string_to_spv(std::string name, const std::string& source, const std::map<s
         return;
     } else if (basename(input_filepath) != source) {
         // Only compile shader variants matching the input filename
+        return;
+    }
+
+    if (shader_excluded(name)) {
+        excluded_shader_names.push_back(name);
         return;
     }
 
@@ -1276,6 +1307,20 @@ void write_output_files() {
         }
     }
 
+    for (const auto& name : excluded_shader_names) {
+        src << "const uint64_t " << name << "_len = 0;\n";
+        src << "const unsigned char " << name << "_data[1] = {0};\n\n";
+    }
+
+    hdr << "inline constexpr bool ggml_vk_mul_mat_id_shaders = " << (mul_mat_id_enabled ? "true" : "false") << ";\n";
+    hdr << "inline constexpr const char * ggml_vk_excluded_types[] = {";
+    for (const auto& tname : type_names) {
+        if (!type_enabled(tname)) {
+            hdr << "\"" << tname << "\", ";
+        }
+    }
+    hdr << "nullptr};\n\n";
+
     std::string suffixes[2] = {"_f32", "_f16"};
     for (std::string op : {"add", "sub", "mul", "div", "add_rms"}) {
         hdr << "extern const void * " << op << "_data[2][2][2];\n";
@@ -1416,6 +1461,23 @@ int main(int argc, char** argv) {
     }
     if (args.find("--target-cpp") != args.end()) {
         target_cpp = args["--target-cpp"]; // Path to generated cpp file
+    }
+    if (args.find("--types") != args.end()) {
+        std::stringstream types(args["--types"]); // Comma-separated tensor types to build
+        for (std::string tname; std::getline(types, tname, ',');) {
+            if (std::find(type_names.begin(), type_names.end(), tname) == type_names.end()) {
+                std::cerr << "Unknown shader type in --types: " << tname << "\n";
+                return EXIT_FAILURE;
+            }
+            enabled_types.push_back(tname);
+        }
+        if (!type_enabled("f32") || !type_enabled("f16")) {
+            std::cerr << "--types must include f32 and f16\n";
+            return EXIT_FAILURE;
+        }
+    }
+    if (args.find("--no-mul-mat-id") != args.end()) {
+        mul_mat_id_enabled = false;
     }
 
     if (!directory_exists(output_dir)) {
