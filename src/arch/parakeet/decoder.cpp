@@ -1817,7 +1817,6 @@ struct WindowScorer {
     std::vector<float>         scratch_x;
     std::vector<float>         logits;
     int64_t                    joint_columns = 0;
-    double                     ilm           = 0.0;  // internal-LM log-probability of the last scored ids
 
     // log P(ids | frames [s, s + W)) under the transducer, starting from
     // `start`. RNN-T: every alignment that has emitted all of `ids` when it
@@ -1835,7 +1834,7 @@ struct WindowScorer {
                int                          next_id,
                double                       floor,
                double &                     out) {
-        const int  W           = joint.W - 1;  // the last column is the internal LM's
+        const int  W           = joint.W;
         const int  U           = static_cast<int>(ids.size());
         const int  n_token_cls = w.predictor.pred_vocab;
         const int  joint_n     = w.joint.joint_n;
@@ -1855,7 +1854,6 @@ struct WindowScorer {
         int token = start.last_token;
         logits.resize(static_cast<size_t>(joint_n) * static_cast<size_t>(W));
         double bound = 0.0;
-        ilm          = 0.0;
         for (int u = 0; u <= U; ++u) {
             const float * g = predictor_step_ggml(w.predictor, pg, token, state, next_state, scratch_x);
             if (g == nullptr) {
@@ -1866,14 +1864,7 @@ struct WindowScorer {
                 return false;
             }
             ggml_backend_tensor_get(joint.logits, logits.data(), 0, logits.size() * sizeof(float));
-            joint_columns += W + 1;
-            if (u < U) {
-                // The internal LM: the token's probability among non-blank
-                // tokens with no audio (a zero encoder projection).
-                float * col = logits.data() + static_cast<size_t>(W) * static_cast<size_t>(joint_n);
-                col[blank]  = -1e30f;
-                ilm += col[ids[static_cast<size_t>(u)]] - log_sum_exp(col, n_token_cls);
-            }
+            joint_columns += W;
             for (int t = 0; t < W; ++t) {
                 const float * col = logits.data() + static_cast<size_t>(t) * static_cast<size_t>(joint_n);
                 const double  lse = log_sum_exp(col, n_token_cls);
@@ -2072,13 +2063,9 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights &    w,
         const int W = static_cast<int>(e - s + 1);
 
         WindowJoint joint;
-        if (!build_window_joint(joint, w.joint, pg.backend, W + 1)) {
+        if (!build_window_joint(joint, w.joint, pg.backend, W)) {
             return TRANSCRIBE_ERR_BACKEND;
         }
-        const std::vector<float> zero(static_cast<size_t>(w.joint.joint_h), 0.0f);
-        ggml_backend_tensor_set(joint.enc_in, zero.data(),
-                                static_cast<size_t>(W) * static_cast<size_t>(w.joint.joint_h) * sizeof(float),
-                                zero.size() * sizeof(float));
         ggml_backend_tensor_set(
             joint.enc_in,
             enc_proj + static_cast<size_t>(s - enc_proj_first_frame) * static_cast<size_t>(w.joint.joint_h), 0,
@@ -2098,14 +2085,10 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights &    w,
         double       term_lp  = 0.0;
         const auto & term     = bias.terms[static_cast<size_t>(c.term)];
         const double boost    = static_cast<double>(bias.boost) * static_cast<double>(term.ids.size());
-        if (!scorer.score(snapshots[snap], heard, next_id, k_neg_inf, heard_lp)) {
+        if (!scorer.score(snapshots[snap], heard, next_id, k_neg_inf, heard_lp) ||
+            !scorer.score(snapshots[snap], term.ids, next_id, heard_lp - boost, term_lp)) {
             return TRANSCRIBE_ERR_BACKEND;
         }
-        const double heard_ilm = scorer.ilm;
-        if (!scorer.score(snapshots[snap], term.ids, next_id, heard_lp - boost, term_lp)) {
-            return TRANSCRIBE_ERR_BACKEND;
-        }
-        const double term_ilm = scorer.ilm;
         joint_columns += scorer.joint_columns;
         ++scored;
         const double gain = term_lp + boost - heard_lp;
@@ -2116,11 +2099,9 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights &    w,
             }
         }
         log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
-                "parakeet vocabulary: \"%s\" for \"%s\" frames %lld-%lld heard %.2f term %.2f boost %.2f -> %s"
-                " (ilm heard %.2f term %.2f, pieces %d/%d)",
+                "parakeet vocabulary: \"%s\" for \"%s\" frames %lld-%lld heard %.2f term %.2f boost %.2f -> %s",
                 term.text.c_str(), span.c_str(), static_cast<long long>(s), static_cast<long long>(e), heard_lp,
-                term_lp, boost, gain >= 0.0 ? "replace" : "keep", heard_ilm, term_ilm, static_cast<int>(heard.size()),
-                static_cast<int>(term.ids.size()));
+                term_lp, boost, gain >= 0.0 ? "replace" : "keep");
         if (gain >= 0.0) {
             accepted.push_back({ c, gain });
         }
