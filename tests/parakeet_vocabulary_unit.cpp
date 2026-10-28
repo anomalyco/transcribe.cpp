@@ -97,6 +97,12 @@ int main() {
               "open code is a candidate for OpenCode");
     }
     {
+        // Addresses and paths are typed, not misheard.
+        const auto b = bias({ "OpenCode" });
+        check(pv::find_vocabulary_candidates(words({ "visit", "opencode.ai", "now" }), b).empty(), "domain");
+        check(!pv::find_vocabulary_candidates(words({ "visit", "open", "code", "now" }), b).empty(), "split");
+    }
+    {
         // Inflections of a term are the term.
         const auto b = bias({ "Aiden", "Effect" });
         check(pv::find_vocabulary_candidates(words({ "ask", "Aiden's", "team" }), b).empty(), "possessive");

@@ -299,12 +299,15 @@ std::vector<VocabularyCandidate> find_vocabulary_candidates(const std::vector<Vo
     }
     const int n_words = static_cast<int>(words.size());
 
-    // Whether words [a, a + n) form a span: every word has a core and only
-    // the last may carry trailing punctuation.
+    // Whether words [a, a + n) form a span: every word has a core with no
+    // address punctuation in it ("opencode.ai", "a/b", "kit@x" are typed
+    // names, not misheard ones) and only the last may carry trailing
+    // punctuation.
     auto is_span = [&](int a, int n) {
         for (int k = a; k < a + n; ++k) {
             const VocabularyWord & w = words[static_cast<size_t>(k)];
-            if (w.core_end <= w.first || (k < a + n - 1 && w.core_end != w.end)) {
+            if (w.core_end <= w.first || (k < a + n - 1 && w.core_end != w.end) ||
+                w.text.find_first_of("./@:\\_") != std::string::npos) {
                 return false;
             }
         }
