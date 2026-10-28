@@ -51,7 +51,7 @@ constexpr int   k_vocab_window_tail       = 6;  // frames after its last
 // Shortest term (in letters) matched by sound alone; shorter terms are
 // matched only through their sounds-like spellings.
 constexpr int   k_vocab_min_fuzzy_letters = 5;
-constexpr float k_vocab_default_boost     = 3.0f;  // nats per term piece
+constexpr float k_vocab_default_boost = 2.5f;  // nats per term piece; see Hex docs/research/vocabulary-boost-results.md
 
 struct VocabularyTerm {
     std::string          text;
