@@ -1,12 +1,18 @@
-// arch/parakeet/vocabulary.h - Custom vocabulary rescoring for the
+// arch/parakeet/vocabulary.h - Custom vocabulary biasing for the
 // transducer heads (RNN-T and TDT).
 //
 // Parakeet takes transcribe_run_params::vocabulary (and the optional
-// transcribe_parakeet_vocabulary_ext) as a post-decode correction, not a
-// decode-time bias. Biasing the greedy argmax toward a term's first piece
-// either never fires (the margin gate holds against a confident "a") or
-// fires on ordinary speech; both were measured. Instead, after the greedy
-// decode:
+// transcribe_parakeet_vocabulary_ext) in one of two ways. Biasing the greedy
+// argmax toward a term's first piece either never fires (the margin gate
+// holds against a confident "a") or fires on ordinary speech, and a full
+// beam search drops whole phrases on this model; all were measured.
+//
+// An offline RNN-T decode runs decode_rnnt_tree (decoder.h): the greedy
+// path stands, and shadow hypotheses spell terms through VocabularyTree
+// alongside it, replacing a greedy span only when a whole term wins at the
+// word boundary (classify_vocabulary_span picks its boost).
+//
+// TDT heads and streams rescore after the greedy decode:
 //
 //   1. find_vocabulary_candidates picks word spans of the transcript whose
 //      letters or consonant skeleton are close to a term, or that equal one
@@ -65,11 +71,9 @@ struct VocabularySpelling {
     int         term = 0;
 };
 
-// The terms as a token trie for decode-time boosting (beam search with
-// shallow fusion). A hypothesis walks the trie as it emits pieces; each
-// piece that follows a term earns the per-piece bonus, and the bonus is
-// taken back if the hypothesis leaves the term before it is complete, or
-// completes it and then keeps spelling the same word ("Hex" + "agon").
+// The terms as a token trie for decode-time boosting (decode_rnnt_tree):
+// a shadow hypothesis walks the trie as it emits pieces, and `max_rem` is
+// the most pieces still to spell below a node.
 struct VocabularyTree {
     enum PieceKind : uint8_t { k_other = 0, k_word_start = 1, k_word_continue = 2 };
 
@@ -87,20 +91,6 @@ struct VocabularyTree {
     int  child(int node, int32_t token) const;
     bool empty() const { return nodes.size() <= 1; }
 };
-
-// Where one hypothesis stands in the tree: its node (0 when it is not in a
-// term) and the bonus earned since it entered the term.
-struct BoostState {
-    int   node    = 0;
-    float pending = 0.0f;
-};
-
-// The score change for emitting `token` from `state`, which it advances.
-float boost_step(const VocabularyTree & tree, float per_piece, BoostState & state, int32_t token);
-
-// The score change when the transcript ends in `state`: an unfinished term
-// gives its bonus back.
-float boost_finish(const VocabularyTree & tree, const BoostState & state);
 
 struct VocabularyBias {
     float                           boost = 0.0f;

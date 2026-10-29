@@ -109,21 +109,24 @@ TRANSCRIBE_API void transcribe_parakeet_buffered_stream_ext_init(struct transcri
 #define TRANSCRIBE_EXT_KIND_PARAKEET_VOCABULARY 0x42564B50u
 
 /*
- * Vocabulary rescoring knobs (run slot; RNN-T and TDT heads). Applies to
+ * Vocabulary biasing knobs (run slot; RNN-T and TDT heads). Applies to
  * transcribe_run, transcribe_run_batch, and transcribe_stream_begin, which
  * copies it.
  *
  * Parakeet honors transcribe_run_params::vocabulary (TRANSCRIBE_FEATURE_
- * VOCABULARY) after its greedy decode: a word span of the transcript that
- * sounds like a term (or matches one of its sounds_like spellings) is
- * rescored against the term over the same encoder frames, and the term
- * replaces it when its alignment log-probability plus `boost` for each of
- * its pieces is at least the span's. Without this extension the family
- * default boost applies.
+ * VOCABULARY). An offline RNN-T run follows its greedy decode and, where
+ * the audio could also spell a term, decodes the term alongside it; the
+ * term replaces the greedy words when it outscores them with `boost` per
+ * piece (0.6 x `boost` when the words do not sound like it). TDT heads and
+ * streams rescore after the greedy decode: a word span that sounds like a
+ * term (or matches one of its sounds_like spellings) is rescored against
+ * the term over the same encoder frames, and the term replaces it when its
+ * alignment log-probability plus `boost` for each of its pieces is at least
+ * the span's. Without this extension the family default boost applies.
  *
  *   boost        Nats added to a term's score per SentencePiece piece of
  *                the term. < 0 selects the family default; 0 turns
- *                rescoring off.
+ *                biasing off.
  *   sounds_like  Optional spellings a transcript may show instead of a
  *                term; sounds_like_term[i] is the index of the
  *                vocabulary entry that sounds_like[i] belongs to.

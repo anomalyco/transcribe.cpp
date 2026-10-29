@@ -311,18 +311,17 @@ transcribe_status decode_ctc_greedy(const HostDecoderWeights & w,
 struct VocabularyBias;
 struct VocabularyTree;
 
-struct BeamOptions {
-    int   beam  = 4;     // hypotheses kept per frame
-    float boost = 1.5f;  // nats per piece of a vocabulary term (shallow fusion)
+struct TreeOptions {
+    // nats per piece of a vocabulary term on a span greedy decoding spelled
+    // some other way
+    float boost = 1.5f;
     // nats per piece when the greedy span also matches the term's consonant
-    // skeleton / sounds-like rules (single-pass tree decoder; 0 uses `boost`)
+    // skeleton or sounds-like rules (0 uses `boost`)
     float skeleton_boost = 0.0f;
-    // nats added per emitted token while searching: this model gives blank so
-    // much weight that summed paths skip whole phrases greedy decoding keeps
-    float token_reward = 0.0f;
-    float gamma = 2.3f;  // a token expands only within gamma nats of its hypothesis's best option, blank included (MAES)
-    bool  max_merge = false;  // merge alignments by max instead of log-add
 };
+
+// TreeOptions::boost as a share of the vocabulary boost (measured at 2.5).
+constexpr float k_tree_boost_ratio = 0.6f;
 
 // RNN-T greedy backbone with local vocabulary-tree branching: ordinary speech
 // follows the exact greedy trajectory (never dropping phrases or drifting on
@@ -335,27 +334,10 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
                                    int                           T_enc,
                                    int                           d_enc,
                                    int                           n_threads,
-                                   const BeamOptions &           options,
+                                   const TreeOptions &           options,
                                    const VocabularyBias &        bias,
                                    std::vector<TdtToken> &       out_tokens,
                                    DecodeCapture *               capture = nullptr);
-
-// RNN-T beam search, frame-synchronous with up to tdt_max_symbols tokens per
-// frame (modified ALSD): every hypothesis steps through the frame together,
-// identical token sequences merge, and the predictor and joint run once per
-// step for the whole beam. With a non-empty `tree`, a hypothesis earns
-// `boost` per piece while it spells a vocabulary term and gives it back if
-// the term is left unfinished (vocabulary.h, boost_step). Same output and
-// capture contract as decode_rnnt_greedy.
-transcribe_status decode_rnnt_beam(const HostDecoderWeights & w,
-                                   const float *              enc_out,
-                                   int                        T_enc,
-                                   int                        d_enc,
-                                   int                        n_threads,
-                                   const BeamOptions &        options,
-                                   const VocabularyTree *     tree,
-                                   std::vector<TdtToken> &    out_tokens,
-                                   DecodeCapture *            capture = nullptr);
 
 // Vocabulary rescoring (vocabulary.h) of the tokens a decoder emitted
 // into `capture`. Spans whose window falls outside the captured frames, or

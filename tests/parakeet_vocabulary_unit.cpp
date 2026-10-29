@@ -130,31 +130,13 @@ int main() {
         check(static_cast<int>(cs.size()) <= pv::k_vocab_max_candidates, "candidates are capped");
     }
     {
-        // Boosting tree. Pieces: 1 "▁A", 2 "bat", 3 "toir", 4 "▁He", 5 "x",
+        // Vocabulary tree. Pieces: 1 "▁A", 2 "bat", 3 "toir", 4 "▁He", 5 "x",
         // 6 "agon", 7 ",", 8 "▁the".
         pv::VocabularyTree tree;
         tree.nodes.assign(1, pv::VocabularyTree::Node{});
         tree.piece_kind = { 0, 1, 2, 2, 1, 2, 2, 0, 1 };
         tree.add({ 1, 2, 3 });  // Abattoir
         tree.add({ 4, 5 });     // Hex
-        auto run = [&](const std::vector<int32_t> & ids) {
-            pv::BoostState s;
-            float          total = 0.0f;
-            for (const int32_t id : ids) {
-                total += pv::boost_step(tree, 1.0f, s, id);
-            }
-            return total + pv::boost_finish(tree, s);
-        };
-        check(run({ 1, 2, 3 }) == 3.0f, "a finished term keeps its bonus");
-        check(run({ 1, 2, 3, 8 }) == 3.0f, "and keeps it into the next word");
-        check(run({ 4, 5, 7 }) == 2.0f, "punctuation after a term keeps it");
-        check(run({ 1, 8 }) == 0.0f, "a left term gives its bonus back");
-        check(run({ 1, 2 }) == 0.0f, "an unfinished term at the end gives it back");
-        check(run({ 4, 5, 6 }) == 0.0f, "a term that keeps spelling the word gives it back");
-        check(run({ 1, 4, 5 }) == 2.0f, "a new term can start where another was left");
-        check(run({ 2, 3 }) == 0.0f, "terms start only at a word");
-        pv::BoostState s;
-        check(pv::boost_step(tree, 1.0f, s, 1) == 1.0f && s.node > 0, "the first piece enters the tree");
         check(tree.nodes[0].max_rem == 3, "root max_rem tracks deepest term");
         check(tree.nodes[static_cast<size_t>(tree.child(0, 1))].max_rem == 2, "first piece max_rem");
         check(tree.nodes[static_cast<size_t>(tree.child(0, 4))].max_rem == 1, "shorter branch max_rem");

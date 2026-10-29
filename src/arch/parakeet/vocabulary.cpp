@@ -125,46 +125,6 @@ int VocabularyTree::child(int node, int32_t token) const {
     return -1;
 }
 
-float boost_step(const VocabularyTree & tree, float per_piece, BoostState & state, int32_t token) {
-    if (tree.empty()) {
-        return 0.0f;
-    }
-    if (state.node != 0) {
-        if (const int next = tree.child(state.node, token); next >= 0) {
-            state.node = next;
-            state.pending += per_piece;
-            return per_piece;
-        }
-    }
-    const auto kind = (token >= 0 && token < static_cast<int32_t>(tree.piece_kind.size())) ?
-                          tree.piece_kind[static_cast<size_t>(token)] :
-                          VocabularyTree::k_other;
-    float      delta = 0.0f;
-    if (state.node != 0) {
-        const bool complete = tree.nodes[static_cast<size_t>(state.node)].end && kind != VocabularyTree::k_word_continue;
-        if (!complete) {
-            delta -= state.pending;
-        }
-        state = BoostState{};
-    }
-    if (kind == VocabularyTree::k_word_start) {
-        if (const int next = tree.child(0, token); next >= 0) {
-            state.node    = next;
-            state.pending = per_piece;
-            delta += per_piece;
-        }
-    }
-    return delta;
-}
-
-float boost_finish(const VocabularyTree & tree, const BoostState & state) {
-    if (state.node <= 0 || state.node >= static_cast<int>(tree.nodes.size()) ||
-        tree.nodes[static_cast<size_t>(state.node)].end) {
-        return 0.0f;
-    }
-    return -state.pending;
-}
-
 std::string vocabulary_letters(const std::string & text) {
     std::string out;
     out.reserve(text.size());

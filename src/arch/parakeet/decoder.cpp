@@ -2168,7 +2168,7 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights &    w,
 
 
 // ---------------------------------------------------------------------------
-// RNN-T beam search
+// RNN-T greedy decode with vocabulary-tree branching
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -2337,8 +2337,7 @@ struct BeamNode {
 };
 
 struct BeamHyp {
-    double     score = 0.0;  // log P(tokens, alignment so far) + boost earned
-    BoostState boost;
+    double     score = 0.0;  // log P(tokens, alignment so far)
     uint64_t   key        = 0;  // hash of the token sequence
     int        tail       = -1;
     int        len        = 0;
@@ -2356,13 +2355,6 @@ struct PredResult {
     std::shared_ptr<const std::vector<float>> proj;
 };
 
-struct BeamExpansion {
-    int        parent = 0;
-    int        token  = 0;
-    double     score  = 0.0;
-    BoostState boost;
-};
-
 uint64_t extend_key(uint64_t key, int token) {
     uint64_t z = key + 0x9e3779b97f4a7c15ULL * static_cast<uint64_t>(token + 2);
     z          = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
@@ -2370,413 +2362,7 @@ uint64_t extend_key(uint64_t key, int token) {
     return z ^ (z >> 31);
 }
 
-// Add `h` to `set`, summing the probability of a hypothesis with the same
-// tokens reached by another alignment.
-void merge_hyp(std::vector<BeamHyp> & set, BeamHyp && h) {
-    for (BeamHyp & b : set) {
-        if (b.key == h.key && b.len == h.len) {
-            const double sum = log_add(b.score, h.score);
-            if (h.score > b.score) {
-                b = std::move(h);
-            }
-            b.score = sum;
-            return;
-        }
-    }
-    set.push_back(std::move(h));
-}
-
 }  // namespace
-
-transcribe_status decode_rnnt_beam(const HostDecoderWeights & w,
-                                   const float *              enc_out,
-                                   int                        T_enc,
-                                   int                        d_enc,
-                                   int                        n_threads,
-                                   const BeamOptions &        options,
-                                   const VocabularyTree *     tree,
-                                   std::vector<TdtToken> &    out_tokens,
-                                   DecodeCapture *            capture) {
-    if (enc_out == nullptr || T_enc <= 0 || d_enc <= 0) {
-        return TRANSCRIBE_ERR_INVALID_ARG;
-    }
-    if (d_enc != w.joint.d_enc || w.head_kind != HostHeadKind::RNNT) {
-        return TRANSCRIBE_ERR_INVALID_ARG;
-    }
-    if (tree != nullptr && tree->empty()) {
-        tree = nullptr;
-    }
-
-    const int nt          = resolve_decode_threads(n_threads);
-    const int n_layers    = static_cast<int>(w.predictor.lstm.size());
-    const int H           = w.predictor.pred_hidden;
-    const int n_token_cls = w.predictor.pred_vocab;
-    const int joint_n     = w.joint.joint_n;
-    const int joint_h     = w.joint.joint_h;
-    const int blank_id    = w.blank_id;
-    const int beam        = std::clamp(options.beam, 1, 16);
-    const int max_sym     = w.tdt_max_symbols > 0 ? w.tdt_max_symbols : 10;
-
-    PredGraph pg;
-    build_pred_graph(pg, w.predictor, nt);
-    if (!pg.ready) {
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder (beam): ggml decode graph build failed");
-        return TRANSCRIBE_ERR_BACKEND;
-    }
-    std::vector<std::unique_ptr<BatchPredGraph>> preds(static_cast<size_t>(beam) + 1);
-    std::vector<std::unique_ptr<BatchJoint>>     joints(static_cast<size_t>(beam) + 1);
-
-    const int64_t      t_start = ggml_time_us();
-    std::vector<float> enc_proj_all;
-    if (!precompute_enc_proj_ggml(w.joint, pg.backend, enc_out, T_enc, d_enc, enc_proj_all)) {
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder (beam): enc_proj graph failed");
-        return TRANSCRIBE_ERR_BACKEND;
-    }
-
-    const size_t       hb = static_cast<size_t>(H) * sizeof(float);
-    std::vector<float> x_host;
-    int64_t            t_pred_us = 0, t_joint_us = 0;
-    int                n_pred = 0, n_joint = 0;
-
-    // Predictor step for each (token, state) pair: out[k] = step(tokens[k], *prev[k]).
-    auto predict = [&](const std::vector<int> & tokens, const std::vector<const LstmState *> & prev,
-                       std::vector<PredResult> & out) -> bool {
-        const int n  = static_cast<int>(tokens.size());
-        auto &    gp = preds[static_cast<size_t>(n)];
-        if (gp == nullptr) {
-            gp = std::make_unique<BatchPredGraph>();
-            if (!build_batch_pred_graph(*gp, w.predictor, w.joint, pg.backend, n)) {
-                return false;
-            }
-        }
-        const int64_t t0 = ggml_time_us();
-        x_host.assign(static_cast<size_t>(n) * static_cast<size_t>(H), 0.0f);
-        for (int k = 0; k < n; ++k) {
-            if (tokens[static_cast<size_t>(k)] >= 0) {
-                std::memcpy(x_host.data() + static_cast<size_t>(k) * static_cast<size_t>(H),
-                            w.predictor.embed_w.data() +
-                                static_cast<size_t>(tokens[static_cast<size_t>(k)]) * static_cast<size_t>(H),
-                            hb);
-            }
-        }
-        ggml_backend_tensor_set(gp->x, x_host.data(), 0, hb * static_cast<size_t>(n));
-        for (int k = 0; k < n; ++k) {
-            for (int l = 0; l < n_layers; ++l) {
-                ggml_backend_tensor_set(gp->ph[l], prev[static_cast<size_t>(k)]->h[static_cast<size_t>(l)].data(),
-                                        hb * static_cast<size_t>(k), hb);
-                ggml_backend_tensor_set(gp->pc[l], prev[static_cast<size_t>(k)]->c[static_cast<size_t>(l)].data(),
-                                        hb * static_cast<size_t>(k), hb);
-            }
-        }
-        if (ggml_backend_graph_compute(pg.backend, gp->graph) != GGML_STATUS_SUCCESS) {
-            return false;
-        }
-        out.resize(static_cast<size_t>(n));
-        const size_t jb = static_cast<size_t>(joint_h) * sizeof(float);
-        for (int k = 0; k < n; ++k) {
-            PredResult & r = out[static_cast<size_t>(k)];
-            r.state.reset(n_layers, H);
-            for (int l = 0; l < n_layers; ++l) {
-                ggml_backend_tensor_get(gp->nh[l], r.state.h[static_cast<size_t>(l)].data(),
-                                        hb * static_cast<size_t>(k), hb);
-                ggml_backend_tensor_get(gp->nc[l], r.state.c[static_cast<size_t>(l)].data(),
-                                        hb * static_cast<size_t>(k), hb);
-            }
-            auto proj = std::make_shared<std::vector<float>>(static_cast<size_t>(joint_h));
-            ggml_backend_tensor_get(gp->proj, proj->data(), jb * static_cast<size_t>(k), jb);
-            r.proj = std::move(proj);
-        }
-        t_pred_us += ggml_time_us() - t0;
-        ++n_pred;
-        return true;
-    };
-
-    // Joint logits for every hypothesis of `set` at frame t, [joint_n] each.
-    std::vector<float> logits;
-    auto               joint = [&](const std::vector<BeamHyp> & set, int t) -> bool {
-        const int n  = static_cast<int>(set.size());
-        auto &    gj = joints[static_cast<size_t>(n)];
-        if (gj == nullptr) {
-            gj = std::make_unique<BatchJoint>();
-            if (!build_batch_joint(*gj, w.joint, pg.backend, n)) {
-                return false;
-            }
-        }
-        const int64_t t0 = ggml_time_us();
-        const size_t  pb = static_cast<size_t>(joint_h) * sizeof(float);
-        for (int k = 0; k < n; ++k) {
-            ggml_backend_tensor_set(gj->proj_in, set[static_cast<size_t>(k)].proj->data(), pb * static_cast<size_t>(k),
-                                    pb);
-        }
-        ggml_backend_tensor_set(gj->enc_in, enc_proj_all.data() + static_cast<size_t>(t) * static_cast<size_t>(joint_h),
-                                0, static_cast<size_t>(joint_h) * sizeof(float));
-        if (ggml_backend_graph_compute(pg.backend, gj->graph) != GGML_STATUS_SUCCESS) {
-            return false;
-        }
-        logits.resize(static_cast<size_t>(joint_n) * static_cast<size_t>(n));
-        ggml_backend_tensor_get(gj->logits, logits.data(), 0, logits.size() * sizeof(float));
-        t_joint_us += ggml_time_us() - t0;
-        ++n_joint;
-        return true;
-    };
-
-    std::vector<BeamNode> nodes;
-    std::vector<BeamHyp>  B(1);
-    {
-        BeamHyp & start = B[0];
-        start.prev.reset(n_layers, H);
-        std::vector<PredResult> out;
-        if (!predict({ -1 }, { &start.prev }, out)) {
-            return TRANSCRIBE_ERR_BACKEND;
-        }
-        start.state = std::move(out[0].state);
-        start.proj  = std::move(out[0].proj);
-    }
-
-    // Root children: every term's first piece, offered to every hypothesis.
-    std::vector<int> root_tokens;
-    if (tree != nullptr) {
-        for (const auto & [id, next] : tree->nodes[0].children) {
-            root_tokens.push_back(id);
-        }
-    }
-
-    std::vector<BeamHyp>       A;
-    std::vector<BeamExpansion> expansions;
-    std::vector<double>        best_by_parent;
-    std::vector<int>           cand;
-    std::vector<float>         scratch_probs;
-    std::vector<uint8_t>       reached;
-    std::vector<PredResult>    new_states;
-    std::unordered_map<uint64_t, PredResult> pred_cache;
-    constexpr size_t           k_pred_cache_max = 512;
-    int                        n_cached         = 0;
-    const int                  k_cp  = DecodeCapture::k_checkpoint_every;
-    const bool                 trace = std::getenv("TRANSCRIBE_PARAKEET_BEAM_TRACE") != nullptr;
-
-    for (int t = 0; t < T_enc; ++t) {
-        A.swap(B);
-        B.clear();
-        for (int s = 0; s <= max_sym && !A.empty(); ++s) {
-            if (!joint(A, t)) {
-                return TRANSCRIBE_ERR_BACKEND;
-            }
-            const int n = static_cast<int>(A.size());
-            expansions.clear();
-            best_by_parent.assign(static_cast<size_t>(n), k_neg_inf);
-            for (int i = 0; i < n; ++i) {
-                const float *   col = logits.data() + static_cast<size_t>(i) * static_cast<size_t>(joint_n);
-                const double    lse = log_sum_exp(col, n_token_cls);
-                const BeamHyp & a   = A[static_cast<size_t>(i)];
-                best_by_parent[static_cast<size_t>(i)] = a.score + (col[blank_id] - lse);
-                {
-                    BeamHyp b = a;
-                    b.score += col[blank_id] - lse;
-                    merge_hyp(B, std::move(b));
-                }
-                if (s == max_sym) {
-                    continue;
-                }
-                // The `beam` likeliest tokens, plus any that continue or start a term.
-                cand.clear();
-                for (int id = 0; id < n_token_cls; ++id) {
-                    if (id == blank_id) {
-                        continue;
-                    }
-                    if (static_cast<int>(cand.size()) < beam) {
-                        cand.push_back(id);
-                        std::push_heap(cand.begin(), cand.end(), [&](int x, int y) { return col[x] > col[y]; });
-                    } else if (col[id] > col[cand.front()]) {
-                        std::pop_heap(cand.begin(), cand.end(), [&](int x, int y) { return col[x] > col[y]; });
-                        cand.back() = id;
-                        std::push_heap(cand.begin(), cand.end(), [&](int x, int y) { return col[x] > col[y]; });
-                    }
-                }
-                if (tree != nullptr) {
-                    auto offer = [&](int id) {
-                        if (id != blank_id && id < n_token_cls && std::find(cand.begin(), cand.end(), id) == cand.end()) {
-                            cand.push_back(id);
-                        }
-                    };
-                    if (a.boost.node > 0) {
-                        for (const auto & [id, next] : tree->nodes[static_cast<size_t>(a.boost.node)].children) {
-                            offer(id);
-                        }
-                    }
-                    for (const int id : root_tokens) {
-                        offer(id);
-                    }
-                }
-                for (const int id : cand) {
-                    BeamExpansion e;
-                    e.parent = i;
-                    e.token  = id;
-                    e.boost  = a.boost;
-                    const float bonus = tree != nullptr ? boost_step(*tree, options.boost, e.boost, id) : 0.0f;
-                    e.score           = a.score + (col[id] - lse) + bonus + options.token_reward;
-                    best_by_parent[static_cast<size_t>(i)] =
-                        std::max(best_by_parent[static_cast<size_t>(i)], e.score);
-                    expansions.push_back(e);
-                }
-            }
-
-            std::sort(B.begin(), B.end(), [](const BeamHyp & x, const BeamHyp & y) { return x.score > y.score; });
-            if (static_cast<int>(B.size()) > beam) {
-                B.resize(static_cast<size_t>(beam));
-            }
-            const double floor = static_cast<int>(B.size()) >= beam ? B.back().score : k_neg_inf;
-            expansions.erase(std::remove_if(expansions.begin(), expansions.end(),
-                                            [&](const BeamExpansion & e) {
-                                                return e.score <= floor ||
-                                                       e.score < best_by_parent[static_cast<size_t>(e.parent)] -
-                                                                     options.gamma;
-                                            }),
-                             expansions.end());
-            if (expansions.empty()) {
-                break;
-            }
-            std::sort(expansions.begin(), expansions.end(),
-                      [](const BeamExpansion & x, const BeamExpansion & y) { return x.score > y.score; });
-            if (static_cast<int>(expansions.size()) > beam) {
-                expansions.resize(static_cast<size_t>(beam));
-            }
-
-            std::vector<int>               tokens;
-            std::vector<const LstmState *> prev;
-            std::vector<uint64_t>          keys;
-            std::vector<int>               batch_of(expansions.size(), -1);
-            if (pred_cache.size() + expansions.size() > k_pred_cache_max) {
-                pred_cache.clear();
-            }
-            for (size_t k = 0; k < expansions.size(); ++k) {
-                const BeamExpansion & e   = expansions[k];
-                const uint64_t        key = extend_key(A[static_cast<size_t>(e.parent)].key, e.token);
-                keys.push_back(key);
-                if (pred_cache.count(key) != 0) {
-                    ++n_cached;
-                    continue;
-                }
-                batch_of[k] = static_cast<int>(tokens.size());
-                tokens.push_back(e.token);
-                prev.push_back(&A[static_cast<size_t>(e.parent)].state);
-            }
-            if (!tokens.empty() && !predict(tokens, prev, new_states)) {
-                return TRANSCRIBE_ERR_BACKEND;
-            }
-            for (size_t k = 0; k < expansions.size(); ++k) {
-                if (batch_of[k] >= 0) {
-                    pred_cache[keys[k]] = new_states[static_cast<size_t>(batch_of[k])];
-                }
-            }
-            std::vector<BeamHyp> next;
-            next.reserve(expansions.size());
-            for (size_t k = 0; k < expansions.size(); ++k) {
-                const BeamExpansion & e      = expansions[k];
-                const BeamHyp &       parent = A[static_cast<size_t>(e.parent)];
-                const float *         col = logits.data() + static_cast<size_t>(e.parent) * static_cast<size_t>(joint_n);
-                BeamNode              node;
-                node.parent = parent.tail;
-                node.id     = e.token;
-                node.p      = token_confidence(col, n_token_cls, scratch_probs);
-                node.step   = t;
-                if (capture != nullptr && parent.len % k_cp == 0) {
-                    node.checkpoint = std::make_unique<PredictorCheckpoint>(
-                        PredictorCheckpoint{ parent.len, parent.last_token, parent.prev });
-                }
-                nodes.push_back(std::move(node));
-                BeamHyp h;
-                h.score      = e.score;
-                h.boost      = e.boost;
-                const PredResult & r = pred_cache.count(keys[k]) != 0 ? pred_cache.at(keys[k])
-                                                                      : new_states[static_cast<size_t>(batch_of[k])];
-                h.key        = keys[k];
-                h.tail       = static_cast<int>(nodes.size()) - 1;
-                h.len        = parent.len + 1;
-                h.last_token = e.token;
-                h.prev       = parent.state;
-                h.state      = r.state;
-                h.proj       = r.proj;
-                next.push_back(std::move(h));
-            }
-            A.swap(next);
-        }
-        A.clear();
-        if (trace) {
-            std::string line;
-            for (const BeamHyp & h : B) {
-                char buf[64];
-                std::snprintf(buf, sizeof(buf), " [len %d %.2f]", h.len, h.score);
-                line += buf;
-            }
-            log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "beam t=%d:%s", t, line.c_str());
-        }
-
-        // Drop the checkpoints no surviving hypothesis can reach.
-        if (capture != nullptr && (t % 64 == 63)) {
-            reached.assign(nodes.size(), 0);
-            for (const BeamHyp & h : B) {
-                for (int i = h.tail; i >= 0 && reached[static_cast<size_t>(i)] == 0; i = nodes[static_cast<size_t>(i)].parent) {
-                    reached[static_cast<size_t>(i)] = 1;
-                }
-            }
-            for (size_t i = 0; i < nodes.size(); ++i) {
-                if (reached[i] == 0) {
-                    nodes[i].checkpoint.reset();
-                }
-            }
-        }
-    }
-
-    if (B.empty()) {
-        return TRANSCRIBE_ERR_BACKEND;
-    }
-    // The final pick is by score per token (NeMo's score_norm): over a long
-    // silence a finished sentence keeps paying a little for every frame it
-    // might have said more, while the empty hypothesis pays nothing, so
-    // raw scores end up preferring "nothing was said".
-    const BeamHyp * best       = nullptr;
-    double          best_score = k_neg_inf;
-    for (const BeamHyp & h : B) {
-        const double final_score =
-            (h.score + (tree != nullptr ? boost_finish(*tree, h.boost) : 0.0)) / static_cast<double>(h.len + 1);
-        if (best == nullptr || final_score > best_score) {
-            best       = &h;
-            best_score = final_score;
-        }
-    }
-    std::vector<int> path;
-    for (int i = best->tail; i >= 0; i = nodes[static_cast<size_t>(i)].parent) {
-        path.push_back(i);
-    }
-    std::reverse(path.begin(), path.end());
-    const size_t first_out = out_tokens.size();
-    for (const int i : path) {
-        BeamNode & node = nodes[static_cast<size_t>(i)];
-        if (capture != nullptr && node.checkpoint != nullptr) {
-            PredictorCheckpoint cp = std::move(*node.checkpoint);
-            cp.token += static_cast<int>(first_out);
-            capture->checkpoints.push_back(std::move(cp));
-        }
-        TdtToken tok;
-        tok.id              = node.id;
-        tok.p               = node.p;
-        tok.step_at_emit    = node.step;
-        tok.duration_frames = 1;
-        out_tokens.push_back(tok);
-    }
-
-    log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
-            "decoder (rnnt beam %d): %d tokens, T_enc=%d  %d joint (%.1f ms)  %d pred (%.1f ms)  %d cached  "
-            "%zu nodes  total=%.1f ms",
-            beam, static_cast<int>(path.size()), T_enc, n_joint, t_joint_us / 1000.0, n_pred, t_pred_us / 1000.0,
-            n_cached, nodes.size(), (ggml_time_us() - t_start) / 1000.0);
-
-    if (capture != nullptr) {
-        capture->enc_proj             = std::move(enc_proj_all);
-        capture->enc_proj_first_frame = 0;
-    }
-    return TRANSCRIBE_OK;
-}
 
 namespace {
 
@@ -2830,11 +2416,11 @@ struct TreeExpansion {
     int              target_step  = 1;
 };
 
-void merge_shadow(std::vector<TreeShadow> & set, TreeShadow && h, bool max_merge) {
+void merge_shadow(std::vector<TreeShadow> & set, TreeShadow && h) {
     for (TreeShadow & b : set) {
         if (b.key == h.key && b.len == h.len && b.origin_len == h.origin_len && b.node == h.node &&
             b.completed_term == h.completed_term) {
-            const double merged = max_merge ? std::max(b.raw_score, h.raw_score) : log_add(b.raw_score, h.raw_score);
+            const double merged = log_add(b.raw_score, h.raw_score);
             const double vit    = std::max(b.vit_score, h.vit_score);
             if (h.vit_score > b.vit_score) {
                 b = std::move(h);
@@ -2855,7 +2441,7 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
                                    int                           T_enc,
                                    int                           d_enc,
                                    int                           n_threads,
-                                   const BeamOptions &           options,
+                                   const TreeOptions &           options,
                                    const VocabularyBias &        bias,
                                    std::vector<TdtToken> &       out_tokens,
                                    DecodeCapture *               capture) {
@@ -3117,7 +2703,7 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
             h.state                 = r.state;
             h.proj                  = r.proj;
             const int step_idx      = fixed_step >= 0 ? fixed_step : e.target_step;
-            merge_shadow(dst_steps[static_cast<size_t>(step_idx)], std::move(h), options.max_merge);
+            merge_shadow(dst_steps[static_cast<size_t>(step_idx)], std::move(h));
         }
         return true;
     };
@@ -3213,7 +2799,7 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
                         waiter.prev         = G.prev;
                         waiter.state        = G.state;
                         waiter.proj         = G.proj;
-                        merge_shadow(shadows, std::move(waiter), options.max_merge);
+                        merge_shadow(shadows, std::move(waiter));
                     }
                 }
             }
@@ -3334,13 +2920,13 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
                             b.raw_score  = next_raw;
                             b.vit_score  = next_vit;
                             b.wait_left  = a.wait_left - 1;
-                            merge_shadow(shadows, std::move(b), options.max_merge);
+                            merge_shadow(shadows, std::move(b));
                         }
                     } else if (next_raw + max_bonus_of(a) >= G.score - k_prune_slack) {
                         TreeShadow b = a;
                         b.raw_score  = next_raw;
                         b.vit_score  = next_vit;
-                        merge_shadow(shadows, std::move(b), options.max_merge);
+                        merge_shadow(shadows, std::move(b));
                     }
                 }
                 if (s == max_sym) {
@@ -3574,7 +3160,7 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
                 continue;
             }
             const double per_pc = (cls > 0) ? skel_boost : tree_boost;
-            const double base   = (options.max_merge || cls == 0) ? s.vit_score : s.raw_score;
+            const double base   = cls == 0 ? s.vit_score : s.raw_score;
             const double eff    = base + static_cast<double>(s.completed_pieces) * per_pc;
             if (eff > best_eff) {
                 best_eff = eff;
