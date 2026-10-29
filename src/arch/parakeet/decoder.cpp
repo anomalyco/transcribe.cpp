@@ -2782,6 +2782,7 @@ namespace {
 
 struct TreeShadow {
     double   raw_score             = 0.0;
+    double   vit_score             = 0.0;
     uint64_t key                   = 0;
     int      tail                  = -1;
     int      len                   = 0;
@@ -2807,6 +2808,7 @@ struct TreeExpansion {
     int    parent                = -1;
     int    token                 = 0;
     double raw_score             = 0.0;
+    double vit_score             = 0.0;
     int    origin_len            = 0;
     int    origin_frame          = 0;
     int    node                  = 0;
@@ -2833,10 +2835,12 @@ void merge_shadow(std::vector<TreeShadow> & set, TreeShadow && h, bool max_merge
         if (b.key == h.key && b.len == h.len && b.origin_len == h.origin_len && b.node == h.node &&
             b.completed_term == h.completed_term) {
             const double merged = max_merge ? std::max(b.raw_score, h.raw_score) : log_add(b.raw_score, h.raw_score);
-            if (h.raw_score > b.raw_score) {
+            const double vit    = std::max(b.vit_score, h.vit_score);
+            if (h.vit_score > b.vit_score) {
                 b = std::move(h);
             }
             b.raw_score = merged;
+            b.vit_score = vit;
             return;
         }
     }
@@ -3093,6 +3097,7 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
                                                                     new_states[static_cast<size_t>(batch_of[k])];
             TreeShadow         h;
             h.raw_score             = e.raw_score;
+            h.vit_score             = e.vit_score;
             h.key                   = keys[k];
             h.tail                  = static_cast<int>(nodes.size()) - 1;
             h.len                   = p_len + 1;
@@ -3136,7 +3141,12 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
             const double  lse        = log_sum_exp(col, n_token_cls);
             const float   best_logit = col[pred_token];
 
-            if (gs < max_sym) {
+            const auto pred_kind = (pred_token >= 0 && pred_token < static_cast<int>(tree.piece_kind.size())) ?
+                                       tree.piece_kind[static_cast<size_t>(pred_token)] :
+                                       VocabularyTree::k_other;
+            const bool mid_word  = (pred_token != blank_id && pred_kind == VocabularyTree::k_word_continue);
+
+            if (gs < max_sym && !mid_word) {
                 const float gate     = (pred_token == blank_id) ? 5.5f : 8.0f;
                 float       p_cached = -1.0f;
                 for (const auto & rc : root_children) {
@@ -3162,6 +3172,7 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
                         req.parent           = -1;
                         req.token            = rid;
                         req.raw_score        = G.score + lp;
+                        req.vit_score        = G.score + lp;
                         req.origin_len       = G.len;
                         req.origin_frame     = t;
                         req.node             = end_now ? 0 : rnode;
@@ -3186,14 +3197,12 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
                         make_req(false);
                     }
                 }
-                const auto pred_kind = (pred_token >= 0 && pred_token < static_cast<int>(tree.piece_kind.size())) ?
-                                           tree.piece_kind[static_cast<size_t>(pred_token)] :
-                                           VocabularyTree::k_other;
                 if (pred_token != blank_id && pred_kind == VocabularyTree::k_word_start) {
                     const double lp_b = static_cast<double>(col[blank_id]) - lse;
                     if (lp_b >= -5.0) {
                         TreeShadow waiter;
                         waiter.raw_score    = G.score + lp_b;
+                        waiter.vit_score    = G.score + lp_b;
                         waiter.key          = G.key;
                         waiter.tail         = G.tail;
                         waiter.len          = G.len;
@@ -3316,17 +3325,21 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
 
                 // Blank transition to next frame.
                 {
-                    const double next_raw = a.raw_score + (static_cast<double>(col[blank_id]) - lse);
+                    const double lp_b     = static_cast<double>(col[blank_id]) - lse;
+                    const double next_raw = a.raw_score + lp_b;
+                    const double next_vit = a.vit_score + lp_b;
                     if (a.node == 0 && a.completed_term < 0) {
                         if (a.wait_left > 1 && next_raw >= G.score - 5.0) {
                             TreeShadow b = a;
                             b.raw_score  = next_raw;
+                            b.vit_score  = next_vit;
                             b.wait_left  = a.wait_left - 1;
                             merge_shadow(shadows, std::move(b), options.max_merge);
                         }
                     } else if (next_raw + max_bonus_of(a) >= G.score - k_prune_slack) {
                         TreeShadow b = a;
                         b.raw_score  = next_raw;
+                        b.vit_score  = next_vit;
                         merge_shadow(shadows, std::move(b), options.max_merge);
                     }
                 }
@@ -3363,6 +3376,7 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
                             e.parent           = static_cast<int>(i);
                             e.token            = rid;
                             e.raw_score        = a.raw_score + lp;
+                            e.vit_score        = a.vit_score + lp;
                             e.origin_len       = a.origin_len;
                             e.origin_frame     = a.origin_frame;
                             e.node             = end_now ? 0 : rnode;
@@ -3395,6 +3409,7 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
                                 e.parent           = static_cast<int>(i);
                                 e.token            = cid;
                                 e.raw_score        = a.raw_score + lp;
+                                e.vit_score        = a.vit_score + lp;
                                 e.origin_len       = a.origin_len;
                                 e.origin_frame     = a.origin_frame;
                                 e.node             = 0;
@@ -3413,6 +3428,7 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
                                 e.parent       = static_cast<int>(i);
                                 e.token        = cid;
                                 e.raw_score    = a.raw_score + lp;
+                                e.vit_score    = a.vit_score + lp;
                                 e.origin_len   = a.origin_len;
                                 e.origin_frame = a.origin_frame;
                                 e.node         = next_node;
@@ -3436,6 +3452,7 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
                                 e.parent                = static_cast<int>(i);
                                 e.token                 = gtok;
                                 e.raw_score             = a.raw_score + lp;
+                                e.vit_score             = a.vit_score + lp;
                                 e.origin_len            = a.origin_len;
                                 e.origin_frame          = a.origin_frame;
                                 e.completed_term        = a.completed_term;
@@ -3508,6 +3525,13 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
                     cur_n                                          = bn.parent;
                 }
             }
+            if (!g_since.empty() && s.origin_len > 0) {
+                const int first_id = g_since.front().id;
+                if (first_id >= 0 && first_id < static_cast<int>(tree.piece_kind.size()) &&
+                    tree.piece_kind[static_cast<size_t>(first_id)] == VocabularyTree::k_word_continue) {
+                    continue;
+                }
+            }
             std::vector<VocabularyWord> g_words = vocabulary_words(tok, g_since);
             if (s.post_words > 0) {
                 int to_drop = s.post_words;
@@ -3550,7 +3574,8 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
                 continue;
             }
             const double per_pc = (cls > 0) ? skel_boost : tree_boost;
-            const double eff    = s.raw_score + static_cast<double>(s.completed_pieces) * per_pc;
+            const double base   = (options.max_merge || cls == 0) ? s.vit_score : s.raw_score;
+            const double eff    = base + static_cast<double>(s.completed_pieces) * per_pc;
             if (eff > best_eff) {
                 best_eff = eff;
                 best_idx = static_cast<int>(i);
@@ -3560,9 +3585,8 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
         if (best_idx >= 0) {
             TreeShadow & win = shadows[static_cast<size_t>(best_idx)];
             log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
-                    "parakeet tree: \"%s\" beat greedy at frame %d (raw %.2f + bonus %.2f > %.2f)",
-                    bias.terms[static_cast<size_t>(win.completed_term)].text.c_str(), t, win.raw_score,
-                    best_eff - win.raw_score, G.score);
+                    "parakeet tree: \"%s\" beat greedy at frame %d (score %.2f > %.2f)",
+                    bias.terms[static_cast<size_t>(win.completed_term)].text.c_str(), t, best_eff, G.score);
             if (win.tail >= 0) {
                 g_last_emit_frame = std::max(g_last_emit_frame, nodes[static_cast<size_t>(win.tail)].step);
             }
@@ -3571,7 +3595,7 @@ transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
             } else {
                 g_last_word_start_frame = std::max(g_last_word_start_frame, win.origin_frame);
             }
-            G.score      = win.raw_score;
+            G.score      = win.vit_score;
             G.key        = win.key;
             G.tail       = win.tail;
             G.len        = win.len;
