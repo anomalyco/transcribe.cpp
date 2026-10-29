@@ -2524,7 +2524,8 @@ transcribe_status decode_rnnt_beam(const HostDecoderWeights & w,
     std::vector<float>         scratch_probs;
     std::vector<uint8_t>       reached;
     std::vector<LstmState>     new_states;
-    const int                  k_cp = DecodeCapture::k_checkpoint_every;
+    const int                  k_cp  = DecodeCapture::k_checkpoint_every;
+    const bool                 trace = std::getenv("TRANSCRIBE_PARAKEET_BEAM_TRACE") != nullptr;
 
     for (int t = 0; t < T_enc; ++t) {
         A.swap(B);
@@ -2651,6 +2652,15 @@ transcribe_status decode_rnnt_beam(const HostDecoderWeights & w,
             A.swap(next);
         }
         A.clear();
+        if (trace) {
+            std::string line;
+            for (const BeamHyp & h : B) {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), " [len %d %.2f]", h.len, h.score);
+                line += buf;
+            }
+            log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "beam t=%d:%s", t, line.c_str());
+        }
 
         // Drop the checkpoints no surviving hypothesis can reach.
         if (capture != nullptr && (t % 64 == 63)) {
