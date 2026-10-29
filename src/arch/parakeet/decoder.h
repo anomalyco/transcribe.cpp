@@ -314,7 +314,7 @@ struct VocabularyTree;
 struct BeamOptions {
     int   beam  = 4;     // hypotheses kept per frame
     float boost = 1.5f;  // nats per piece of a vocabulary term (shallow fusion)
-    float gamma = 6.0f;  // a token expands only within gamma nats of its hypothesis's best
+    float gamma = 2.3f;  // a token expands only within gamma nats of its hypothesis's best option, blank included (MAES)
 };
 
 // RNN-T beam search, frame-synchronous with up to tdt_max_symbols tokens per

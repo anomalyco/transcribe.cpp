@@ -45,6 +45,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -2180,7 +2181,8 @@ struct BatchPredGraph {
     ggml_cgraph *              graph = nullptr;
     ggml_tensor *              x     = nullptr;  // [H, N]
     std::vector<ggml_tensor *> ph, pc, nh, nc;   // [H, N] per layer
-    int                        N = 0;
+    ggml_tensor *              proj = nullptr;   // [joint_h, N] pred_w @ h + pred_b
+    int                        N    = 0;
 
     BatchPredGraph() = default;
 
@@ -2197,7 +2199,11 @@ struct BatchPredGraph {
     BatchPredGraph & operator=(const BatchPredGraph &) = delete;
 };
 
-bool build_batch_pred_graph(BatchPredGraph & g, const HostPredictor & p, ggml_backend_t backend, int N) {
+bool build_batch_pred_graph(BatchPredGraph &      g,
+                            const HostPredictor & p,
+                            const HostJoint &     j,
+                            ggml_backend_t        backend,
+                            int                   N) {
     const int H = p.pred_hidden;
     const int L = static_cast<int>(p.lstm.size());
     g.N         = N;
@@ -2242,6 +2248,8 @@ bool build_batch_pred_graph(BatchPredGraph & g, const HostPredictor & p, ggml_ba
         ggml_set_output(g.nh[l]);
         in = g.nh[l];
     }
+    g.proj = ggml_add(g.ctx, ggml_mul_mat(g.ctx, j.g_pred_w, in), j.g_pred_b);
+    ggml_set_output(g.proj);
     g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, backend);
     if (g.buf == nullptr) {
         return false;
@@ -2251,16 +2259,18 @@ bool build_batch_pred_graph(BatchPredGraph & g, const HostPredictor & p, ggml_ba
         ggml_build_forward_expand(g.graph, g.nh[l]);
         ggml_build_forward_expand(g.graph, g.nc[l]);
     }
+    ggml_build_forward_expand(g.graph, g.proj);
     return true;
 }
 
-// The joint for N predictor outputs at one encoder frame:
-// logits[joint_n, N] = out_w @ act(enc_proj + pred_w @ pred[:, n] + pred_b) + out_b.
+// The joint for N hypotheses at one encoder frame, from each one's
+// projected predictor output (computed once, with its predictor step):
+// logits[joint_n, N] = out_w @ act(enc_proj + proj[:, n]) + out_b.
 struct BatchJoint {
     ggml_context *        ctx     = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
     ggml_cgraph *         graph   = nullptr;
-    ggml_tensor *         pred_in = nullptr;  // [pred_hidden, N]
+    ggml_tensor *         proj_in = nullptr;  // [joint_h, N]
     ggml_tensor *         enc_in  = nullptr;  // [joint_h]
     ggml_tensor *         logits  = nullptr;  // [joint_n, N]
     int                   N       = 0;
@@ -2290,12 +2300,11 @@ bool build_batch_joint(BatchJoint & g, const HostJoint & j, ggml_backend_t backe
     if (g.ctx == nullptr) {
         return false;
     }
-    g.pred_in = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, j.pred_hidden, N);
-    ggml_set_input(g.pred_in);
+    g.proj_in = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, j.joint_h, N);
+    ggml_set_input(g.proj_in);
     g.enc_in = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, j.joint_h);
     ggml_set_input(g.enc_in);
-    ggml_tensor * pred_proj = ggml_add(g.ctx, ggml_mul_mat(g.ctx, j.g_pred_w, g.pred_in), j.g_pred_b);
-    ggml_tensor * summed    = ggml_add(g.ctx, pred_proj, g.enc_in);
+    ggml_tensor * summed = ggml_add(g.ctx, g.proj_in, g.enc_in);
     ggml_tensor * activated;
     if (j.activation == "relu") {
         activated = ggml_relu(g.ctx, summed);
@@ -2336,6 +2345,15 @@ struct BeamHyp {
     int        last_token = -1;
     LstmState  prev;   // the predictor before consuming last_token
     LstmState  state;  // and after; state.h.back() is the decoder output
+    std::shared_ptr<const std::vector<float>> proj;  // pred_w @ state.h.back() + pred_b
+};
+
+// A predictor step's result, kept by token-sequence key: in a long pause the
+// same expansion is proposed frame after frame, and the LSTM is the costliest
+// part of a step.
+struct PredResult {
+    LstmState                                 state;
+    std::shared_ptr<const std::vector<float>> proj;
 };
 
 struct BeamExpansion {
@@ -2422,12 +2440,12 @@ transcribe_status decode_rnnt_beam(const HostDecoderWeights & w,
 
     // Predictor step for each (token, state) pair: out[k] = step(tokens[k], *prev[k]).
     auto predict = [&](const std::vector<int> & tokens, const std::vector<const LstmState *> & prev,
-                       std::vector<LstmState> & out) -> bool {
+                       std::vector<PredResult> & out) -> bool {
         const int n  = static_cast<int>(tokens.size());
         auto &    gp = preds[static_cast<size_t>(n)];
         if (gp == nullptr) {
             gp = std::make_unique<BatchPredGraph>();
-            if (!build_batch_pred_graph(*gp, w.predictor, pg.backend, n)) {
+            if (!build_batch_pred_graph(*gp, w.predictor, w.joint, pg.backend, n)) {
                 return false;
             }
         }
@@ -2454,14 +2472,19 @@ transcribe_status decode_rnnt_beam(const HostDecoderWeights & w,
             return false;
         }
         out.resize(static_cast<size_t>(n));
+        const size_t jb = static_cast<size_t>(joint_h) * sizeof(float);
         for (int k = 0; k < n; ++k) {
-            out[static_cast<size_t>(k)].reset(n_layers, H);
+            PredResult & r = out[static_cast<size_t>(k)];
+            r.state.reset(n_layers, H);
             for (int l = 0; l < n_layers; ++l) {
-                ggml_backend_tensor_get(gp->nh[l], out[static_cast<size_t>(k)].h[static_cast<size_t>(l)].data(),
+                ggml_backend_tensor_get(gp->nh[l], r.state.h[static_cast<size_t>(l)].data(),
                                         hb * static_cast<size_t>(k), hb);
-                ggml_backend_tensor_get(gp->nc[l], out[static_cast<size_t>(k)].c[static_cast<size_t>(l)].data(),
+                ggml_backend_tensor_get(gp->nc[l], r.state.c[static_cast<size_t>(l)].data(),
                                         hb * static_cast<size_t>(k), hb);
             }
+            auto proj = std::make_shared<std::vector<float>>(static_cast<size_t>(joint_h));
+            ggml_backend_tensor_get(gp->proj, proj->data(), jb * static_cast<size_t>(k), jb);
+            r.proj = std::move(proj);
         }
         t_pred_us += ggml_time_us() - t0;
         ++n_pred;
@@ -2480,10 +2503,10 @@ transcribe_status decode_rnnt_beam(const HostDecoderWeights & w,
             }
         }
         const int64_t t0 = ggml_time_us();
-        const size_t  pb = static_cast<size_t>(w.joint.pred_hidden) * sizeof(float);
+        const size_t  pb = static_cast<size_t>(joint_h) * sizeof(float);
         for (int k = 0; k < n; ++k) {
-            ggml_backend_tensor_set(gj->pred_in, set[static_cast<size_t>(k)].state.h.back().data(),
-                                    pb * static_cast<size_t>(k), pb);
+            ggml_backend_tensor_set(gj->proj_in, set[static_cast<size_t>(k)].proj->data(), pb * static_cast<size_t>(k),
+                                    pb);
         }
         ggml_backend_tensor_set(gj->enc_in, enc_proj_all.data() + static_cast<size_t>(t) * static_cast<size_t>(joint_h),
                                 0, static_cast<size_t>(joint_h) * sizeof(float));
@@ -2502,11 +2525,12 @@ transcribe_status decode_rnnt_beam(const HostDecoderWeights & w,
     {
         BeamHyp & start = B[0];
         start.prev.reset(n_layers, H);
-        std::vector<LstmState> out;
+        std::vector<PredResult> out;
         if (!predict({ -1 }, { &start.prev }, out)) {
             return TRANSCRIBE_ERR_BACKEND;
         }
-        start.state = std::move(out[0]);
+        start.state = std::move(out[0].state);
+        start.proj  = std::move(out[0].proj);
     }
 
     // Root children: every term's first piece, offered to every hypothesis.
@@ -2523,7 +2547,10 @@ transcribe_status decode_rnnt_beam(const HostDecoderWeights & w,
     std::vector<int>           cand;
     std::vector<float>         scratch_probs;
     std::vector<uint8_t>       reached;
-    std::vector<LstmState>     new_states;
+    std::vector<PredResult>    new_states;
+    std::unordered_map<uint64_t, PredResult> pred_cache;
+    constexpr size_t           k_pred_cache_max = 512;
+    int                        n_cached         = 0;
     const int                  k_cp  = DecodeCapture::k_checkpoint_every;
     const bool                 trace = std::getenv("TRANSCRIBE_PARAKEET_BEAM_TRACE") != nullptr;
 
@@ -2541,6 +2568,7 @@ transcribe_status decode_rnnt_beam(const HostDecoderWeights & w,
                 const float *   col = logits.data() + static_cast<size_t>(i) * static_cast<size_t>(joint_n);
                 const double    lse = log_sum_exp(col, n_token_cls);
                 const BeamHyp & a   = A[static_cast<size_t>(i)];
+                best_by_parent[static_cast<size_t>(i)] = a.score + (col[blank_id] - lse);
                 {
                     BeamHyp b = a;
                     b.score += col[blank_id] - lse;
@@ -2615,12 +2643,30 @@ transcribe_status decode_rnnt_beam(const HostDecoderWeights & w,
 
             std::vector<int>               tokens;
             std::vector<const LstmState *> prev;
-            for (const BeamExpansion & e : expansions) {
+            std::vector<uint64_t>          keys;
+            std::vector<int>               batch_of(expansions.size(), -1);
+            if (pred_cache.size() + expansions.size() > k_pred_cache_max) {
+                pred_cache.clear();
+            }
+            for (size_t k = 0; k < expansions.size(); ++k) {
+                const BeamExpansion & e   = expansions[k];
+                const uint64_t        key = extend_key(A[static_cast<size_t>(e.parent)].key, e.token);
+                keys.push_back(key);
+                if (pred_cache.count(key) != 0) {
+                    ++n_cached;
+                    continue;
+                }
+                batch_of[k] = static_cast<int>(tokens.size());
                 tokens.push_back(e.token);
                 prev.push_back(&A[static_cast<size_t>(e.parent)].state);
             }
-            if (!predict(tokens, prev, new_states)) {
+            if (!tokens.empty() && !predict(tokens, prev, new_states)) {
                 return TRANSCRIBE_ERR_BACKEND;
+            }
+            for (size_t k = 0; k < expansions.size(); ++k) {
+                if (batch_of[k] >= 0) {
+                    pred_cache[keys[k]] = new_states[static_cast<size_t>(batch_of[k])];
+                }
             }
             std::vector<BeamHyp> next;
             next.reserve(expansions.size());
@@ -2641,12 +2687,15 @@ transcribe_status decode_rnnt_beam(const HostDecoderWeights & w,
                 BeamHyp h;
                 h.score      = e.score;
                 h.boost      = e.boost;
-                h.key        = extend_key(parent.key, e.token);
+                const PredResult & r = pred_cache.count(keys[k]) != 0 ? pred_cache.at(keys[k])
+                                                                      : new_states[static_cast<size_t>(batch_of[k])];
+                h.key        = keys[k];
                 h.tail       = static_cast<int>(nodes.size()) - 1;
                 h.len        = parent.len + 1;
                 h.last_token = e.token;
                 h.prev       = parent.state;
-                h.state      = std::move(new_states[k]);
+                h.state      = r.state;
+                h.proj       = r.proj;
                 next.push_back(std::move(h));
             }
             A.swap(next);
@@ -2717,10 +2766,10 @@ transcribe_status decode_rnnt_beam(const HostDecoderWeights & w,
     }
 
     log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
-            "decoder (rnnt beam %d): %d tokens, T_enc=%d  %d joint (%.1f ms)  %d pred (%.1f ms)  %zu nodes  "
-            "total=%.1f ms",
+            "decoder (rnnt beam %d): %d tokens, T_enc=%d  %d joint (%.1f ms)  %d pred (%.1f ms)  %d cached  "
+            "%zu nodes  total=%.1f ms",
             beam, static_cast<int>(path.size()), T_enc, n_joint, t_joint_us / 1000.0, n_pred, t_pred_us / 1000.0,
-            nodes.size(), (ggml_time_us() - t_start) / 1000.0);
+            n_cached, nodes.size(), (ggml_time_us() - t_start) / 1000.0);
 
     if (capture != nullptr) {
         capture->enc_proj             = std::move(enc_proj_all);
