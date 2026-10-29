@@ -314,6 +314,9 @@ struct VocabularyTree;
 struct BeamOptions {
     int   beam  = 4;     // hypotheses kept per frame
     float boost = 1.5f;  // nats per piece of a vocabulary term (shallow fusion)
+    // nats added per emitted token while searching: this model gives blank so
+    // much weight that summed paths skip whole phrases greedy decoding keeps
+    float token_reward = 0.0f;
     float gamma = 2.3f;  // a token expands only within gamma nats of its hypothesis's best option, blank included (MAES)
 };
 

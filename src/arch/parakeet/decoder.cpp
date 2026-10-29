@@ -2613,7 +2613,7 @@ transcribe_status decode_rnnt_beam(const HostDecoderWeights & w,
                     e.token  = id;
                     e.boost  = a.boost;
                     const float bonus = tree != nullptr ? boost_step(*tree, options.boost, e.boost, id) : 0.0f;
-                    e.score           = a.score + (col[id] - lse) + bonus;
+                    e.score           = a.score + (col[id] - lse) + bonus + options.token_reward;
                     best_by_parent[static_cast<size_t>(i)] =
                         std::max(best_by_parent[static_cast<size_t>(i)], e.score);
                     expansions.push_back(e);

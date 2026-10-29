@@ -919,6 +919,9 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
     if (const char * v = std::getenv("TRANSCRIBE_PARAKEET_BEAM_GAMMA")) {
         beam.gamma = static_cast<float>(std::atof(v));
     }
+    if (const char * v = std::getenv("TRANSCRIBE_PARAKEET_BEAM_TOKEN_REWARD")) {
+        beam.token_reward = static_cast<float>(std::atof(v));
+    }
     const char * rescore_env = std::getenv("TRANSCRIBE_PARAKEET_BEAM_RESCORE");
     const bool   rescore     = beam.beam <= 0 || rescore_env == nullptr || std::atoi(rescore_env) != 0;
 
