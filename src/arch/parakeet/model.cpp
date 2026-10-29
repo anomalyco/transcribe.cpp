@@ -40,6 +40,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <ios>
@@ -906,8 +907,23 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
             return st;
         }
     }
+    // Measurement knobs while beam search is evaluated.
+    BeamOptions beam;
+    beam.beam = 0;
+    if (const char * v = std::getenv("TRANSCRIBE_PARAKEET_BEAM")) {
+        beam.beam = std::atoi(v);
+    }
+    if (const char * v = std::getenv("TRANSCRIBE_PARAKEET_BEAM_BOOST")) {
+        beam.boost = static_cast<float>(std::atof(v));
+    }
+    if (const char * v = std::getenv("TRANSCRIBE_PARAKEET_BEAM_GAMMA")) {
+        beam.gamma = static_cast<float>(std::atof(v));
+    }
+    const char * rescore_env = std::getenv("TRANSCRIBE_PARAKEET_BEAM_RESCORE");
+    const bool   rescore     = beam.beam <= 0 || rescore_env == nullptr || std::atoi(rescore_env) != 0;
+
     DecodeCapture   capture;
-    DecodeCapture * capture_out = vocabulary.active() ? &capture : nullptr;
+    DecodeCapture * capture_out = vocabulary.active() && rescore ? &capture : nullptr;
 
     pc->raw_tokens.clear();
     const int64_t t_dec_start = ggml_time_us();
@@ -918,8 +934,14 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
                 st = decode_tdt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens, capture_out);
                 break;
             case HostHeadKind::RNNT:
-                st =
-                    decode_rnnt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens, capture_out);
+                if (beam.beam > 0) {
+                    st = decode_rnnt_beam(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, beam,
+                                          vocabulary.active() ? &vocabulary.tree : nullptr, pc->raw_tokens,
+                                          capture_out);
+                } else {
+                    st = decode_rnnt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens,
+                                            capture_out);
+                }
                 break;
             case HostHeadKind::CTC:
                 st = decode_ctc_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens);

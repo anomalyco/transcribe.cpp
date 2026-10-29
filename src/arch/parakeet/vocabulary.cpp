@@ -87,6 +87,75 @@ bool add_term(const Tokenizer & tok, const std::string & raw, VocabularyBias & o
 
 }  // namespace
 
+void VocabularyTree::add(const std::vector<int32_t> & ids) {
+    if (nodes.empty()) {
+        nodes.emplace_back();
+    }
+    int node = 0;
+    for (const int32_t id : ids) {
+        int next = child(node, id);
+        if (next < 0) {
+            next = static_cast<int>(nodes.size());
+            nodes[static_cast<size_t>(node)].children.emplace_back(id, next);
+            nodes.emplace_back();
+        }
+        node = next;
+    }
+    nodes[static_cast<size_t>(node)].end = true;
+}
+
+int VocabularyTree::child(int node, int32_t token) const {
+    if (node < 0 || node >= static_cast<int>(nodes.size())) {
+        return -1;
+    }
+    for (const auto & [id, next] : nodes[static_cast<size_t>(node)].children) {
+        if (id == token) {
+            return next;
+        }
+    }
+    return -1;
+}
+
+float boost_step(const VocabularyTree & tree, float per_piece, BoostState & state, int32_t token) {
+    if (tree.empty()) {
+        return 0.0f;
+    }
+    if (state.node != 0) {
+        if (const int next = tree.child(state.node, token); next >= 0) {
+            state.node = next;
+            state.pending += per_piece;
+            return per_piece;
+        }
+    }
+    const auto kind = (token >= 0 && token < static_cast<int32_t>(tree.piece_kind.size())) ?
+                          tree.piece_kind[static_cast<size_t>(token)] :
+                          VocabularyTree::k_other;
+    float      delta = 0.0f;
+    if (state.node != 0) {
+        const bool complete = tree.nodes[static_cast<size_t>(state.node)].end && kind != VocabularyTree::k_word_continue;
+        if (!complete) {
+            delta -= state.pending;
+        }
+        state = BoostState{};
+    }
+    if (kind == VocabularyTree::k_word_start) {
+        if (const int next = tree.child(0, token); next >= 0) {
+            state.node    = next;
+            state.pending = per_piece;
+            delta += per_piece;
+        }
+    }
+    return delta;
+}
+
+float boost_finish(const VocabularyTree & tree, const BoostState & state) {
+    if (state.node <= 0 || state.node >= static_cast<int>(tree.nodes.size()) ||
+        tree.nodes[static_cast<size_t>(state.node)].end) {
+        return 0.0f;
+    }
+    return -state.pending;
+}
+
 std::string vocabulary_letters(const std::string & text) {
     std::string out;
     out.reserve(text.size());
@@ -219,6 +288,24 @@ transcribe_status compile_vocabulary(const Tokenizer &             tok,
         const char * term = params->vocabulary[i];
         if (term != nullptr && add_term(tok, term, out)) {
             compiled[static_cast<size_t>(i)] = static_cast<int>(out.terms.size()) - 1;
+        }
+    }
+    if (!out.terms.empty()) {
+        out.tree.nodes.assign(1, VocabularyTree::Node{});
+        out.tree.piece_kind.assign(static_cast<size_t>(std::max(tok.n_tokens(), 0)), VocabularyTree::k_other);
+        for (int id = 0; id < tok.n_tokens(); ++id) {
+            if (is_special_piece(tok, id)) {
+                continue;
+            }
+            const std::string & piece = tok.token(id);
+            if (piece.size() >= k_sp_marker_len && std::memcmp(piece.data(), k_sp_marker, k_sp_marker_len) == 0) {
+                out.tree.piece_kind[static_cast<size_t>(id)] = VocabularyTree::k_word_start;
+            } else if (has_alnum(piece)) {
+                out.tree.piece_kind[static_cast<size_t>(id)] = VocabularyTree::k_word_continue;
+            }
+        }
+        for (const VocabularyTerm & term : out.terms) {
+            out.tree.add(term.ids);
         }
     }
     if (ext != nullptr) {

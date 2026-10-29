@@ -65,10 +65,46 @@ struct VocabularySpelling {
     int         term = 0;
 };
 
+// The terms as a token trie for decode-time boosting (beam search with
+// shallow fusion). A hypothesis walks the trie as it emits pieces; each
+// piece that follows a term earns the per-piece bonus, and the bonus is
+// taken back if the hypothesis leaves the term before it is complete, or
+// completes it and then keeps spelling the same word ("Hex" + "agon").
+struct VocabularyTree {
+    enum PieceKind : uint8_t { k_other = 0, k_word_start = 1, k_word_continue = 2 };
+
+    struct Node {
+        std::vector<std::pair<int32_t, int>> children;  // (token id, node)
+        bool                                 end = false;
+    };
+
+    std::vector<Node>    nodes;       // nodes[0] is the root
+    std::vector<uint8_t> piece_kind;  // per token id
+
+    void add(const std::vector<int32_t> & ids);
+    int  child(int node, int32_t token) const;
+    bool empty() const { return nodes.size() <= 1; }
+};
+
+// Where one hypothesis stands in the tree: its node (0 when it is not in a
+// term) and the bonus earned since it entered the term.
+struct BoostState {
+    int   node    = 0;
+    float pending = 0.0f;
+};
+
+// The score change for emitting `token` from `state`, which it advances.
+float boost_step(const VocabularyTree & tree, float per_piece, BoostState & state, int32_t token);
+
+// The score change when the transcript ends in `state`: an unfinished term
+// gives its bonus back.
+float boost_finish(const VocabularyTree & tree, const BoostState & state);
+
 struct VocabularyBias {
     float                           boost = 0.0f;
     std::vector<VocabularyTerm>     terms;
     std::vector<VocabularySpelling> spellings;
+    VocabularyTree                  tree;
 
     bool active() const { return boost > 0.0f && !terms.empty(); }
 };
