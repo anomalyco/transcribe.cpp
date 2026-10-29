@@ -75,13 +75,15 @@ struct VocabularyTree {
 
     struct Node {
         std::vector<std::pair<int32_t, int>> children;  // (token id, node)
-        bool                                 end = false;
+        bool                                 end     = false;
+        int                                  term    = -1;
+        int                                  max_rem = 0;
     };
 
     std::vector<Node>    nodes;       // nodes[0] is the root
     std::vector<uint8_t> piece_kind;  // per token id
 
-    void add(const std::vector<int32_t> & ids);
+    void add(const std::vector<int32_t> & ids, int term = -1);
     int  child(int node, int32_t token) const;
     bool empty() const { return nodes.size() <= 1; }
 };
@@ -138,6 +140,15 @@ struct VocabularyCandidate {
 // k_vocab_max_candidates. Pure (no model access).
 std::vector<VocabularyCandidate> find_vocabulary_candidates(const std::vector<VocabularyWord> & words,
                                                             const VocabularyBias &              bias);
+
+// Classify a greedy word span covered by a decode-time vocabulary hypothesis:
+//  -1: keep greedy (already written, case-only, inflection, address/path, or
+//      swallows a neighbouring word around a closer inner span)
+//   0: non-skeleton match (dropped word or short near-miss; use tree boost)
+//   1: phonetic/skeleton or sounds-like match (use full vocabulary boost)
+int classify_vocabulary_span(const std::vector<VocabularyWord> & span_words,
+                             const VocabularyBias &              bias,
+                             int                                 term_index);
 
 // Lowercase ASCII letters and digits of `text`; other ASCII is dropped and
 // non-ASCII bytes are kept.

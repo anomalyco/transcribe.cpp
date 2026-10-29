@@ -87,7 +87,7 @@ bool add_term(const Tokenizer & tok, const std::string & raw, VocabularyBias & o
 
 }  // namespace
 
-void VocabularyTree::add(const std::vector<int32_t> & ids) {
+void VocabularyTree::add(const std::vector<int32_t> & ids, int term) {
     if (nodes.empty()) {
         nodes.emplace_back();
     }
@@ -101,7 +101,16 @@ void VocabularyTree::add(const std::vector<int32_t> & ids) {
         }
         node = next;
     }
-    nodes[static_cast<size_t>(node)].end = true;
+    nodes[static_cast<size_t>(node)].end  = true;
+    nodes[static_cast<size_t>(node)].term = term;
+    for (int i = static_cast<int>(nodes.size()) - 1; i >= 0; --i) {
+        int rem = 0;
+        for (const auto & [cid, child_idx] : nodes[static_cast<size_t>(i)].children) {
+            (void) cid;
+            rem = std::max(rem, 1 + nodes[static_cast<size_t>(child_idx)].max_rem);
+        }
+        nodes[static_cast<size_t>(i)].max_rem = rem;
+    }
 }
 
 int VocabularyTree::child(int node, int32_t token) const {
@@ -304,8 +313,8 @@ transcribe_status compile_vocabulary(const Tokenizer &             tok,
                 out.tree.piece_kind[static_cast<size_t>(id)] = VocabularyTree::k_word_continue;
             }
         }
-        for (const VocabularyTerm & term : out.terms) {
-            out.tree.add(term.ids);
+        for (size_t t = 0; t < out.terms.size(); ++t) {
+            out.tree.add(out.terms[t].ids, static_cast<int>(t));
         }
     }
     if (ext != nullptr) {
@@ -342,6 +351,16 @@ std::vector<VocabularyWord> vocabulary_words(const Tokenizer & tok, const std::v
             return;
         }
         cur.end = end;
+        // Leave a trailing possessive "'s" outside the core ("Avatar's" ->
+        // core "Avatar"), so rescoring scores the stem up to the apostrophe
+        // and keeps "'s" intact on replacement.
+        if (cur.core_end >= cur.first + 3) {
+            const int a_id = tokens[static_cast<size_t>(cur.core_end - 2)].id;
+            const int s_id = tokens[static_cast<size_t>(cur.core_end - 1)].id;
+            if (tok.decode(&a_id, 1) == "'" && vocabulary_letters(tok.decode(&s_id, 1)) == "s") {
+                cur.core_end -= 2;
+            }
+        }
         if (cur.core_end > cur.first) {
             std::vector<int> ids;
             for (int i = cur.first; i < cur.core_end; ++i) {
@@ -488,6 +507,91 @@ std::vector<VocabularyCandidate> find_vocabulary_candidates(const std::vector<Vo
         out.resize(static_cast<size_t>(k_vocab_max_candidates));
     }
     return out;
+}
+
+int classify_vocabulary_span(const std::vector<VocabularyWord> & span_words,
+                             const VocabularyBias &              bias,
+                             int                                 term_index) {
+    if (term_index < 0 || term_index >= static_cast<int>(bias.terms.size())) {
+        return -1;
+    }
+    if (span_words.empty()) {
+        return 0;
+    }
+    const int n = static_cast<int>(span_words.size());
+    for (int k = 0; k < n; ++k) {
+        const VocabularyWord & w = span_words[static_cast<size_t>(k)];
+        if (w.core_end <= w.first || (k < n - 1 && w.core_end != w.end) ||
+            w.text.find_first_of("./@:\\_") != std::string::npos) {
+            return -1;
+        }
+    }
+    auto span_letters = [&](int a, int len) {
+        std::string letters;
+        for (int k = a; k < a + len; ++k) {
+            letters += vocabulary_letters(span_words[static_cast<size_t>(k)].text);
+        }
+        return letters;
+    };
+    const VocabularyTerm & term    = bias.terms[static_cast<size_t>(term_index)];
+    const std::string      letters = span_letters(0, n);
+    std::string            text;
+    for (int k = 0; k < n; ++k) {
+        text += (k > 0 ? " " : "") + span_words[static_cast<size_t>(k)].text;
+    }
+    if (text == term.text || (n == 1 && letters == term.letters)) {
+        return -1;
+    }
+    if (letters.size() > term.letters.size() && letters.compare(0, term.letters.size(), term.letters) == 0) {
+        const std::string rest = letters.substr(term.letters.size());
+        if (rest == "s" || rest == "es" || rest == "ed" || rest == "d" || rest == "ing" || rest == "er" ||
+            rest == "ers") {
+            return -1;
+        }
+    }
+    if (n > 1) {
+        for (int a = 0; a < n; ++a) {
+            for (int len = 1; len < n && a + len <= n; ++len) {
+                if (span_letters(a, len) == term.letters) {
+                    return -1;
+                }
+            }
+        }
+    }
+    auto rank_of = [&](const std::string & ls) -> float {
+        for (const VocabularySpelling & s : bias.spellings) {
+            if (s.term == term_index && s.letters == ls) {
+                return 0.0f;
+            }
+        }
+        if (ls == term.letters) {
+            return 0.01f;
+        }
+        const int L = static_cast<int>(term.letters.size());
+        const int S = static_cast<int>(ls.size());
+        if (L < k_vocab_min_fuzzy_letters || S * 2 < L || S > L * 2) {
+            return -1.0f;
+        }
+        const int d_letters = vocabulary_edit_distance(ls, term.letters);
+        const int d_skel    = vocabulary_edit_distance(vocabulary_skeleton(ls), term.skeleton);
+        const int max_skel  = term.skeleton.size() >= 5 ? 1 : 0;
+        if (d_letters > std::max(1, L / 3) && d_skel > max_skel) {
+            return -1.0f;
+        }
+        return static_cast<float>(d_letters) / static_cast<float>(L) + 0.5f * static_cast<float>(d_skel);
+    };
+    const float rank = rank_of(letters);
+    if (rank >= 0.0f) {
+        if (n > 1) {
+            const float inner_tail = rank_of(span_letters(1, n - 1));
+            const float inner_head = rank_of(span_letters(0, n - 1));
+            if ((inner_tail >= 0.0f && inner_tail <= rank) || (inner_head >= 0.0f && inner_head <= rank)) {
+                return -1;
+            }
+        }
+        return 1;
+    }
+    return n == 1 ? 0 : -1;
 }
 
 }  // namespace transcribe::parakeet

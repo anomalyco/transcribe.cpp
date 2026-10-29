@@ -155,6 +155,23 @@ int main() {
         check(run({ 2, 3 }) == 0.0f, "terms start only at a word");
         pv::BoostState s;
         check(pv::boost_step(tree, 1.0f, s, 1) == 1.0f && s.node > 0, "the first piece enters the tree");
+        check(tree.nodes[0].max_rem == 3, "root max_rem tracks deepest term");
+        check(tree.nodes[static_cast<size_t>(tree.child(0, 1))].max_rem == 2, "first piece max_rem");
+        check(tree.nodes[static_cast<size_t>(tree.child(0, 4))].max_rem == 1, "shorter branch max_rem");
+    }
+    {
+        // Decode-time span classification.
+        const auto b = bias({ "Abattoir", "OpenCode", "Kit", "Hex", "Moonshine" });
+        check(pv::classify_vocabulary_span({}, b, 0) == 0, "dropped span uses tree boost");
+        check(pv::classify_vocabulary_span(words({ "avatar" }), b, 0) == 1, "skeleton match uses full boost");
+        check(pv::classify_vocabulary_span(words({ "open", "code" }), b, 1) == 1, "split match uses full boost");
+        check(pv::classify_vocabulary_span(words({ "Kip" }), b, 2) == 0, "short near-miss uses tree boost");
+        check(pv::classify_vocabulary_span(words({ "to", "Kip" }), b, 2) == -1, "non-skeleton multi-word rejected");
+        check(pv::classify_vocabulary_span(words({ "hexed" }), b, 3) == -1, "inflection rejected");
+        check(pv::classify_vocabulary_span(words({ "moonshine" }), b, 4) == -1, "case-only rejected");
+        check(pv::classify_vocabulary_span(words({ "The", "moonshine" }), b, 4) == -1, "swallowed neighbour rejected");
+        check(pv::classify_vocabulary_span(words({ "opencode.ai" }), b, 1) == -1, "domain rejected");
+        check(pv::classify_vocabulary_span(words({ "the", "avatar" }), b, 0) == -1, "swallowed article rejected");
     }
 
     if (g_failures != 0) {

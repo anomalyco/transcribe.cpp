@@ -314,11 +314,31 @@ struct VocabularyTree;
 struct BeamOptions {
     int   beam  = 4;     // hypotheses kept per frame
     float boost = 1.5f;  // nats per piece of a vocabulary term (shallow fusion)
+    // nats per piece when the greedy span also matches the term's consonant
+    // skeleton / sounds-like rules (single-pass tree decoder; 0 uses `boost`)
+    float skeleton_boost = 0.0f;
     // nats added per emitted token while searching: this model gives blank so
     // much weight that summed paths skip whole phrases greedy decoding keeps
     float token_reward = 0.0f;
     float gamma = 2.3f;  // a token expands only within gamma nats of its hypothesis's best option, blank included (MAES)
+    bool  max_merge = false;  // merge alignments by max instead of log-add
 };
+
+// RNN-T greedy backbone with local vocabulary-tree branching: ordinary speech
+// follows the exact greedy trajectory (never dropping phrases or drifting on
+// non-term words), while acoustically plausible entries into `bias.tree` walk
+// the trie in shadow hypotheses and replace the greedy span only if a complete
+// term wins at the word boundary.
+transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
+                                   const transcribe::Tokenizer & tok,
+                                   const float *                 enc_out,
+                                   int                           T_enc,
+                                   int                           d_enc,
+                                   int                           n_threads,
+                                   const BeamOptions &           options,
+                                   const VocabularyBias &        bias,
+                                   std::vector<TdtToken> &       out_tokens,
+                                   DecodeCapture *               capture = nullptr);
 
 // RNN-T beam search, frame-synchronous with up to tdt_max_symbols tokens per
 // frame (modified ALSD): every hypothesis steps through the frame together,

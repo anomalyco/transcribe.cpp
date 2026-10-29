@@ -909,12 +909,19 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
     }
     // Measurement knobs while beam search is evaluated.
     BeamOptions beam;
-    beam.beam = 0;
+    beam.beam      = 0;
+    bool tree_mode = false;
+    if (const char * v = std::getenv("TRANSCRIBE_PARAKEET_TREE")) {
+        tree_mode = std::atoi(v) != 0;
+    }
     if (const char * v = std::getenv("TRANSCRIBE_PARAKEET_BEAM")) {
         beam.beam = std::atoi(v);
     }
     if (const char * v = std::getenv("TRANSCRIBE_PARAKEET_BEAM_BOOST")) {
         beam.boost = static_cast<float>(std::atof(v));
+    }
+    if (const char * v = std::getenv("TRANSCRIBE_PARAKEET_BEAM_SKEL_BOOST")) {
+        beam.skeleton_boost = static_cast<float>(std::atof(v));
     }
     if (const char * v = std::getenv("TRANSCRIBE_PARAKEET_BEAM_GAMMA")) {
         beam.gamma = static_cast<float>(std::atof(v));
@@ -922,8 +929,11 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
     if (const char * v = std::getenv("TRANSCRIBE_PARAKEET_BEAM_TOKEN_REWARD")) {
         beam.token_reward = static_cast<float>(std::atof(v));
     }
+    if (const char * v = std::getenv("TRANSCRIBE_PARAKEET_BEAM_MAX")) {
+        beam.max_merge = std::atoi(v) != 0;
+    }
     const char * rescore_env = std::getenv("TRANSCRIBE_PARAKEET_BEAM_RESCORE");
-    const bool   rescore     = beam.beam <= 0 || rescore_env == nullptr || std::atoi(rescore_env) != 0;
+    const bool   rescore     = (!tree_mode && beam.beam <= 0) || rescore_env == nullptr || std::atoi(rescore_env) != 0;
 
     DecodeCapture   capture;
     DecodeCapture * capture_out = vocabulary.active() && rescore ? &capture : nullptr;
@@ -937,7 +947,10 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
                 st = decode_tdt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens, capture_out);
                 break;
             case HostHeadKind::RNNT:
-                if (beam.beam > 0) {
+                if (tree_mode) {
+                    st = decode_rnnt_tree(pm->host_decoder, pm->tok, enc, T_enc, d_enc, pc->n_threads, beam, vocabulary,
+                                          pc->raw_tokens, capture_out);
+                } else if (beam.beam > 0) {
                     st = decode_rnnt_beam(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, beam,
                                           vocabulary.active() ? &vocabulary.tree : nullptr, pc->raw_tokens,
                                           capture_out);
