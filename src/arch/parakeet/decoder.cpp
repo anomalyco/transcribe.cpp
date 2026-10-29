@@ -2681,10 +2681,15 @@ transcribe_status decode_rnnt_beam(const HostDecoderWeights & w,
     if (B.empty()) {
         return TRANSCRIBE_ERR_BACKEND;
     }
+    // The final pick is by score per token (NeMo's score_norm): over a long
+    // silence a finished sentence keeps paying a little for every frame it
+    // might have said more, while the empty hypothesis pays nothing, so
+    // raw scores end up preferring "nothing was said".
     const BeamHyp * best       = nullptr;
     double          best_score = k_neg_inf;
     for (const BeamHyp & h : B) {
-        const double final_score = h.score + (tree != nullptr ? boost_finish(*tree, h.boost) : 0.0);
+        const double final_score =
+            (h.score + (tree != nullptr ? boost_finish(*tree, h.boost) : 0.0)) / static_cast<double>(h.len + 1);
         if (best == nullptr || final_score > best_score) {
             best       = &h;
             best_score = final_score;
