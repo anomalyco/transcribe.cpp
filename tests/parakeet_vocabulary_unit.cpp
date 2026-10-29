@@ -97,6 +97,12 @@ int main() {
               "open code is a candidate for OpenCode");
     }
     {
+        // One consonant sound off counts only in a long name.
+        const auto b = bias({ "Parakeet" });
+        check(pv::find_vocabulary_candidates(words({ "that's", "right" }), b).empty(), "right is not Parakeet");
+        check(!pv::find_vocabulary_candidates(words({ "para", "keet" }), b).empty(), "para keet is");
+    }
+    {
         // Addresses and paths are typed, not misheard.
         const auto b = bias({ "OpenCode" });
         check(pv::find_vocabulary_candidates(words({ "visit", "opencode.ai", "now" }), b).empty(), "domain");

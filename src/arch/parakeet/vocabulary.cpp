@@ -338,7 +338,9 @@ std::vector<VocabularyCandidate> find_vocabulary_candidates(const std::vector<Vo
         }
         const int d_letters = vocabulary_edit_distance(letters, term.letters);
         const int d_skel    = vocabulary_edit_distance(vocabulary_skeleton(letters), term.skeleton);
-        const int max_skel  = term.skeleton.size() >= 4 ? 1 : 0;
+        // One consonant sound off is a mishearing only in a long name; in a
+        // short one it matches ordinary words ("right" for "Parakeet").
+        const int max_skel  = term.skeleton.size() >= 5 ? 1 : 0;
         if (d_letters > std::max(1, L / 3) && d_skel > max_skel) {
             return -1.0f;
         }
